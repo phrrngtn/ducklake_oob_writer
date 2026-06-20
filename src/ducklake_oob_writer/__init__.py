@@ -20,6 +20,13 @@ from ducklake_oob_writer.catalog import (
     _build_metadata,
     create_catalog,
 )
+from ducklake_oob_writer.maintenance import (
+    attach_lake,
+    cleanup_old_files,
+    compact,
+    expire_snapshots,
+    run_maintenance,
+)
 from ducklake_oob_writer.parquet import footer_and_size
 from ducklake_oob_writer.writer import DuckLakeWriter
 
@@ -30,4 +37,10 @@ __all__ = [
     "create_catalog",
     "DuckLakeWriter",
     "footer_and_size",
+    # maintenance (delegated to DuckLake's native engine; needs the `duckdb` extra)
+    "attach_lake",
+    "compact",
+    "expire_snapshots",
+    "cleanup_old_files",
+    "run_maintenance",
 ]

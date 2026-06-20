@@ -28,6 +28,8 @@ The headline reason is **carrying the source's transaction-time onto the DuckLak
 | `DUCKLAKE_VERSION` | constant | DuckLake catalog protocol version (`"1.0"`) |
 | `DuckLakeWriter(engine, meta)` | class | OOB writer |
 | `footer_and_size(path)` | function | `(file_size_bytes, footer_size)` for a Parquet file (stdlib-only) |
+| `run_maintenance(catalog, data_path, older_than=None)` | function | Compact (attempted) + expire + cleanup; needs `[maintenance]` extra |
+| `attach_lake` / `compact` / `expire_snapshots` / `cleanup_old_files` | functions | Individual maintenance ops (see [Maintenance](#maintenance)) |
 
 ### `DuckLakeWriter` methods
 
@@ -83,6 +85,41 @@ con.sql("SELECT * FROM lake.lts_hourly")
 
 DuckLake **1.0** internal type names: `varchar`, `timestamp`, `date`, `boolean`,
 `float64` (DOUBLE), `int64` (BIGINT), `int32` (INTEGER), `decimal(p,s)`.
+
+## Maintenance
+
+Maintenance (compaction, expiring snapshots, GC) is **delegated to DuckLake's own
+engine** rather than reimplemented — it's complex and its natural timestamp is
+genuinely `now()`. Needs the `duckdb` extra: `uv add "ducklake-oob-writer[maintenance]"`.
+
+```python
+import ducklake_oob_writer as dl
+summary = dl.run_maintenance("sqlite:/lake/catalog.sqlite", "/lake/data",
+                             older_than="2026-01-01")   # expire+cleanup; compaction attempted
+```
+
+| Function | On a pure-OOB catalog |
+|----------|------------------------|
+| `expire_snapshots(catalog, data_path, older_than=...)` | ✅ works |
+| `cleanup_old_files(catalog, data_path)` | ✅ works |
+| `compact(catalog, data_path)` | ⚠️ **not yet supported** — see below |
+
+**Compaction caveat.** `ducklake_merge_adjacent_files` reads per-column statistics
+and row-id ranges that the OOB writer does not currently emit, so on a pure-OOB
+catalog `compact()` raises a DuckDB `InternalException`. `run_maintenance` attempts
+it and reports the gap in `summary["compact_error"]` rather than failing the pass.
+Emitting those statistics at registration time is a roadmap item.
+
+## Examples
+
+Runnable demos in [`examples/`](examples/) (use the `dev` group for `duckdb`):
+
+```bash
+uv run --group dev python examples/01_quickstart.py
+```
+
+Covers quickstart, source-time time-travel, late-arriving backfill, merge-on-read,
+maintenance, and a Postgres-catalog variant. See [`examples/README.md`](examples/README.md).
 
 ## Dependencies
 
