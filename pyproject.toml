@@ -1,0 +1,33 @@
+[project]
+name = "ducklake-oob-writer"
+version = "0.1.0"
+description = "Out-of-band writer for DuckLake catalogs: register externally-written Parquet directly into the catalog tables via SQLAlchemy (Postgres/SQLite/DuckDB)."
+readme = "README.md"
+requires-python = ">=3.11"
+license = "MIT"
+authors = [
+    { name = "Paul Harrington", email = "phrrngtn@panix.com" },
+]
+keywords = ["ducklake", "lakehouse", "parquet", "sqlalchemy", "catalog", "cdc"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "Topic :: Database",
+    "Typing :: Typed",
+]
+dependencies = [
+    "sqlalchemy>=2.0",
+]
+
+[project.urls]
+Homepage = "https://github.com/phrrngtn/ducklake_oob_writer"
+Source = "https://github.com/phrrngtn/ducklake_oob_writer"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/ducklake_oob_writer"]
