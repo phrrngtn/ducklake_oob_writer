@@ -37,8 +37,8 @@ The headline reason is **carrying the source's transaction-time onto the DuckLak
 |--------|-------------|
 | `init_catalog(data_path, version=DUCKLAKE_VERSION, author=None)` | One-time bootstrap: snapshot 0, `main` schema, metadata |
 | `create_table(schema_name, table_name, columns, snapshot_time=None, ...)` | Register a new table + columns (`columns` = list of `(name, ducklake_type)`) |
-| `register_data_file(table_name, path, record_count, file_size_bytes, footer_size, snapshot_time=None, column_stats=None, ...)` | Register a Parquet data file (`path` is **relative to the table directory**); pass `column_stats` for compaction-readiness |
-| `register_parquet(table_name, fs_path, snapshot_time=None, ...)` | Convenience: read an on-disk Parquet file and register it **compaction-ready** (computes size/footer/record-count/column-stats via DuckDB) |
+| `register_data_file(table_name, path, record_count, file_size_bytes, footer_size, snapshot_time=None, column_stats=None, ...)` | Register a Parquet data file (`path` is **relative to the table directory**); pass `column_stats` to add query-pruning stats |
+| `register_parquet(table_name, fs_path, snapshot_time=None, ...)` | Convenience: read an on-disk Parquet file and register it, computing size/footer/record-count + per-column *pruning* stats via DuckDB |
 | `current_tables()` / `current_columns(table)` / `snapshots()` | Introspection |
 
 ## Installation
@@ -103,15 +103,18 @@ summary = dl.run_maintenance("sqlite:/lake/catalog.sqlite", "/lake/data",
 |----------|-------------------|
 | `expire_snapshots(catalog, data_path, older_than=...)` | ✅ works |
 | `cleanup_old_files(catalog, data_path)` | ✅ works |
-| `compact(catalog, data_path)` | ✅ works for **compaction-ready** files (see below) |
+| `compact(catalog, data_path)` | ✅ works for any registered file (see below) |
 
-**Compaction readiness.** `ducklake_merge_adjacent_files` reads per-column
-statistics and contiguous row-id ranges. Register files with
-**`register_parquet`** (or `register_data_file(column_stats=...)`) and the writer
-emits `ducklake_table_stats`, `ducklake_file_column_stats`, and the row-id ranges
-that make them compactable. Files registered with the bare `register_data_file`
-and no `column_stats` are still queryable but not compactable; `run_maintenance`
-reports that in `summary["compact_error"]` instead of failing the pass.
+**What compaction actually needs.** `ducklake_merge_adjacent_files`
+(`GetFilesForCompaction`) reads each table's per-table `ducklake_schema_versions`
+row by `table_id`, and `create_table` always emits it — so **any file registered
+through `create_table` + `register_data_file` is compactable**. `column_stats` /
+`register_parquet` are **not** required for compaction; they add per-column
+statistics for query *pruning*. The only catalogs that can't compact are ones
+missing the per-table `schema_versions` row (e.g. written by a pre-fix version of
+this package, or another tool); `run_maintenance` reports that in
+`summary["compact_error"]` instead of failing the pass. See the design doc for the
+DuckLake-source citation.
 
 ### Boundary
 
@@ -119,12 +122,12 @@ reports that in `summary["compact_error"]` instead of failing the pass.
 compaction.** The actual data-file work is performed entirely by DuckDB's native
 `ducklake` engine — `compact`, `expire_snapshots`, and `cleanup_old_files` each
 just `ATTACH` the catalog and issue a single `CALL ducklake_*(...)`. The package's
-*only* contribution to compaction is to **enable** it: the writer emits the
-statistics and contiguous row-id ranges that DuckLake's native compaction planner
-requires, at registration time. (Reading one Parquet file to *compute* those
-statistics in `register_parquet` is metadata work, not compaction.) The boundary
-is enforced by `tests/test_native_compaction.py`, which also verifies native
-compaction of OOB-written files preserves data exactly, merges files, keeps
+*only* contribution to compaction is to **enable** it: the writer emits, at
+registration time, the per-table `ducklake_schema_versions` row the native
+compaction planner reads (plus row-id bookkeeping). (Reading a Parquet file to
+*compute* pruning stats in `register_parquet` is metadata work, not compaction.)
+The boundary is enforced by `tests/test_native_compaction.py`, which also verifies
+native compaction of OOB-written files preserves data exactly, merges files, keeps
 row-ids contiguous, and leaves time-travel and re-append working.
 
 ## Examples

@@ -19,13 +19,15 @@ Boundary
 This package **never reads, merges, or rewrites Parquet data files for
 compaction**. The actual data-file work is done entirely by DuckDB's native
 ``ducklake`` engine; the functions here only ``ATTACH`` the catalog and issue a
-single ``CALL ducklake_*(...)``. The package's *only* contribution to compaction
-is to *enable* it: the OOB writer emits, at registration time, the statistics and
-contiguous row-id ranges (``ducklake_table_stats``, ``ducklake_file_column_stats``,
-``row_id_start``, ``schema_versions.table_id``) that DuckLake's native compaction
-planner requires. (Reading a single Parquet file to *compute* those statistics in
-``DuckLakeWriter.register_parquet`` is metadata work, not compaction.) This boundary
-is enforced by ``tests/test_native_compaction.py``.
+single ``CALL ducklake_*(...)``. The package's *only* contribution to compaction is to
+*enable* it: the OOB writer emits, at registration time, the one thing the native
+compaction planner actually requires — a per-table ``ducklake_schema_versions``
+row with a non-NULL ``table_id`` (written by ``create_table``) — plus the row-id
+bookkeeping (``ducklake_table_stats`` / ``row_id_start``). Per-column
+``ducklake_file_column_stats`` are for query pruning, NOT compaction. (Reading a
+Parquet file to *compute* pruning stats in ``DuckLakeWriter.register_parquet`` is
+metadata work, not compaction.) This boundary is enforced by
+``tests/test_native_compaction.py``.
 
 This module needs the ``duckdb`` package, which is an optional dependency::
 
@@ -102,14 +104,20 @@ def attach_lake(catalog: str, data_path: str, *, alias: str = _ALIAS,
 def compact(catalog: str, data_path: str, *, con=None) -> None:
     """Compact adjacent small Parquet files into larger ones.
 
-    Requires that the files were registered **compaction-ready** — i.e. with
-    per-column statistics and contiguous row-id ranges. Use
-    ``DuckLakeWriter.register_parquet`` (or ``register_data_file(column_stats=...)``)
-    for that. Files registered with the bare ``register_data_file`` and no
-    ``column_stats`` lack the per-file statistics DuckLake's compaction planner
-    reads, and this will raise a DuckDB ``InternalException``
-    ("GetValueInternal on a value that is NULL"). :func:`expire_snapshots` and
-    :func:`cleanup_old_files` do not need the statistics and work either way.
+    Works for any file registered through ``DuckLakeWriter.create_table`` +
+    ``register_data_file``. The compaction planner
+    (``DuckLakeMetadataManager::GetFilesForCompaction``) reads each table's
+    per-table ``ducklake_schema_versions`` row by ``table_id`` and consumes the
+    resulting ``schema_version`` with an *unchecked* read — so the only hard
+    requirement is that per-table row, which ``create_table`` always emits.
+    ``column_stats`` are **not** needed for compaction (they add query-pruning
+    stats only — see the design doc).
+
+    The only way this raises a DuckDB ``InternalException``
+    ("GetValueInternal on a value that is NULL") is a catalog missing that
+    per-table ``schema_versions`` row — e.g. one written by a pre-fix version of
+    this package, or by another tool. :func:`expire_snapshots` and
+    :func:`cleanup_old_files` never depend on it.
     """
     with attach_lake(catalog, data_path, con=con) as c:
         c.execute(f"CALL ducklake_merge_adjacent_files('{_ALIAS}')")
@@ -151,11 +159,12 @@ def run_maintenance(catalog: str, data_path: str, *, older_than=None,
     others. ``expire_snapshots`` runs only if ``older_than`` is given
     (history-preserving by default).
 
-    **Compaction note:** ``ducklake_merge_adjacent_files`` requires files
-    registered compaction-ready (via ``register_parquet`` / ``column_stats``; see
-    :func:`compact`). For files registered without statistics it raises;
-    ``run_maintenance`` catches that and records it in ``summary["compact_error"]``
-    rather than failing the whole pass. Set ``attempt_compaction=False`` to skip it.
+    **Compaction note:** files registered through ``create_table`` +
+    ``register_data_file`` are compactable (see :func:`compact`). The only catalogs
+    that fail are those missing a per-table ``schema_versions`` row (e.g. pre-fix or
+    foreign catalogs); ``run_maintenance`` catches that and records it in
+    ``summary["compact_error"]`` rather than failing the whole pass. Set
+    ``attempt_compaction=False`` to skip it.
 
     Returns a summary dict: ``compacted``, ``compact_error``, ``expired``,
     ``cleaned_files``.

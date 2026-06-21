@@ -180,3 +180,42 @@ def test_maintenance_is_delegated_to_native_not_reimplemented():
     assert "COPY " not in msrc
     # The writer emits catalog metadata/stats only; it never compacts.
     assert "ducklake_merge_adjacent_files" not in inspect.getsource(_w)
+
+
+def test_bare_register_data_file_is_compactable(tmp_path):
+    """Compaction needs only the per-table `ducklake_schema_versions` row that
+    `create_table` emits — NOT `column_stats`. A file registered via the bare
+    `register_data_file` (no `column_stats`, hence no `ducklake_file_column_stats`)
+    compacts. Locks in the DuckLake-source finding (GetFilesForCompaction reads
+    schema_versions + data_file only)."""
+    import sqlite3
+
+    data = os.path.join(str(tmp_path), "data")
+    os.makedirs(os.path.join(data, "main", "t"), exist_ok=True)
+    catalog = f"sqlite:{tmp_path}/c.sqlite"
+    eng = create_engine(f"sqlite:///{tmp_path}/c.sqlite")
+    dl.create_catalog(eng)
+    w = dl.DuckLakeWriter(eng, dl.DUCKLAKE_METADATA)
+    w.init_catalog(data_path=data)
+    w.create_table("main", "t", columns=[("i", "int64")])
+
+    dw = duckdb.connect()
+    for i in range(5):
+        fp = os.path.join(data, "main", "t", f"b{i}.parquet")
+        dw.execute(f"COPY (SELECT {i}::bigint AS i) TO '{fp}' (FORMAT PARQUET)")
+        n = dw.execute("SELECT count(*) FROM read_parquet(?)", [fp]).fetchone()[0]
+        fs, ft = dl.footer_and_size(fp)
+        w.register_data_file("t", path=f"b{i}.parquet", record_count=n,  # NO column_stats
+                             file_size_bytes=fs, footer_size=ft,
+                             snapshot_time=dt.datetime(2026, 6, 20) + dt.timedelta(minutes=i))
+    dw.close()
+    eng.dispose()
+
+    # prove no per-file column stats were written ...
+    c = sqlite3.connect(f"{tmp_path}/c.sqlite")
+    assert c.execute("SELECT count(*) FROM ducklake_file_column_stats").fetchone()[0] == 0
+    c.close()
+    # ... yet native compaction still works and preserves the data.
+    with dl.attach_lake(catalog, data) as con:
+        con.execute("CALL ducklake_merge_adjacent_files('lake')")
+        assert con.execute("SELECT count(*) FROM lake.t").fetchone()[0] == 5

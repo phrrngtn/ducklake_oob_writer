@@ -101,25 +101,71 @@ engine**, and the package draws a hard line here:
 > extension. `compact()` / `expire_snapshots()` / `cleanup_old_files()` each
 > `ATTACH` the catalog and issue a single `CALL ducklake_*(...)`.
 
-The package's *only* role in compaction is to **enable** it. DuckLake's native
-compaction planner reads statistics and contiguous row-id ranges that a naive OOB
-registration omits — so the writer emits them at registration time:
+The package's *only* role in compaction is to **enable** it. The one thing
+DuckLake's native compaction planner actually requires that a naive OOB
+registration omits is a **per-table `ducklake_schema_versions` row** — so the
+writer emits it (plus row-id bookkeeping) at registration time:
 
-- `ducklake_table_stats` — `record_count` / `next_row_id` / `file_size_bytes`,
-  maintained on `create_table` and every `register_data_file`.
-- contiguous `row_id_start` per file (the running `next_row_id`).
-- `ducklake_schema_versions.table_id` — set to the new table (a NULL here makes the
-  native planner read a NULL `uint64` and assert; this was the original blocker).
+- **`ducklake_schema_versions.table_id`** — set to the new table by `create_table`.
+  This is *the* compaction requirement (see the citation below); a NULL here makes
+  the planner read a NULL `uint64` and assert.
+- `ducklake_table_stats` — `record_count` / `next_row_id` / `file_size_bytes`, and
+  contiguous `row_id_start` per file — the row-id bookkeeping, maintained on
+  `create_table` and every `register_data_file`.
 - `ducklake_file_column_stats` — per-column counts/sizes/min/max, populated when
-  `column_stats` is supplied (e.g. by `register_parquet`).
+  `column_stats` is supplied (e.g. by `register_parquet`). **For query pruning, NOT
+  compaction** — see below.
 
-Reading a single Parquet file to *compute* those statistics (inside
-`register_parquet`) is metadata work, not compaction — the boundary is about never
-doing the data-file *merge/rewrite* in Python. The boundary and the correctness of
-native compaction over OOB-written files are enforced by
-`tests/test_native_compaction.py` (exact-data preservation across types + NULLs,
-real file reduction, valid merged Parquet, contiguous row-ids, time-travel, and
-re-append after compaction).
+Reading a Parquet file to *compute* pruning stats (inside `register_parquet`) is
+metadata work, not compaction — the boundary is about never doing the data-file
+*merge/rewrite* in Python. The boundary and the correctness of native compaction
+over OOB-written files are enforced by `tests/test_native_compaction.py`
+(exact-data preservation across types + NULLs, real file reduction, valid merged
+Parquet, contiguous row-ids, time-travel, re-append, and **bare-`register_data_file`
+compaction** with no column stats).
+
+### Spec vs. implementation: the `schema_versions.table_id` invariant
+
+Native compaction over OOB-written files needs one thing the **published catalog
+schema does not declare**: every table must have a per-table
+`ducklake_schema_versions` row with a non-NULL `table_id`. This is an
+*implementation* invariant, not a protocol constraint. Studied from the DuckLake
+extension source (`github.com/duckdb/ducklake`,
+`src/storage/ducklake_metadata_manager.cpp`):
+
+1. **The schema declares the column nullable.** The catalog DDL (~line 281):
+   ```sql
+   CREATE TABLE {METADATA_CATALOG}.ducklake_schema_versions(
+     begin_snapshot BIGINT, schema_version BIGINT, table_id BIGINT);  -- nullable; no NOT NULL
+   ```
+2. **The implementation requires it non-NULL anyway.** `table_id` was added in the
+   v0.3→0.4 migration (`MigrateV03`), which converts `schema_versions` from a global
+   version log to per-table tracking, backfills `table_id`, then:
+   ```sql
+   DELETE FROM {METADATA_CATALOG}.ducklake_schema_versions WHERE table_id IS NULL;
+   ```
+   The extension's own migration deletes the rows the schema permits.
+3. **The compaction planner reads it unchecked.** `GetFilesForCompaction`
+   (~line 2207) builds `snapshot_ranges` from `ducklake_schema_versions WHERE
+   table_id = <table>`, LEFT-JOINs the data files to it, and reads the resulting
+   `schema_version` with no null check:
+   ```cpp
+   new_entry.file.row_id_start = ...;            // IsNull-checked
+   new_entry.file.end_snapshot = row.IsNull(..)? // IsNull-checked
+   new_entry.schema_version = row.GetValue<idx_t>(col_idx++);  // <-- NOT null-checked
+   ```
+   With `table_id = NULL` the LEFT JOIN yields NULL `schema_version`, and that
+   unchecked `GetValue<idx_t>` is the `"GetValueInternal on a value that is NULL"`
+   assert.
+
+**Consequences:** (a) implementing the published table schemas is *necessary but
+not sufficient* — an OOB writer must also satisfy this implementation invariant;
+(b) `GetFilesForCompaction` reads only `schema_versions` + `ducklake_data_file`
+columns, **not** the stats tables, so `column_stats`/`file_column_stats` are *not*
+a compaction prerequisite (verified: bare `register_data_file` compacts). They are
+purely for query pruning. (c) The catalog protocol keeps evolving — a `v1.1`
+metadata manager already exists upstream — so pinning `DUCKLAKE_VERSION` and
+tracking the source remains load-bearing.
 
 ## Provenance
 
