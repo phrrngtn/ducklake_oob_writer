@@ -18,5 +18,7 @@ uv run --group dev python examples/01_quickstart.py
 | `04_merge_on_read.py` | Append-only revisions resolved at read time with `ROW_NUMBER()` — idempotent, no in-place UPDATE. |
 | `05_maintenance.py` | Compaction + cleanup via `run_maintenance` (delegated to DuckLake's engine; needs the `duckdb` extra). |
 | `06_postgres_catalog.py` | Same writer code, Postgres catalog backend (for federation). Skips cleanly without a server. |
+| `07_concurrent_reader.py` | A DuckDB reader sees the OOB writer's commits appear live — concurrent readers are safe. |
+| `08_concurrent_writers.py` | The single-writer assumption: serialized hand-off works; a stale writer fails loud (PK rollback), never corrupts. See the README "Concurrency" section. |
 
 `_common.py` is a helper, not part of the public API.

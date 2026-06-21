@@ -29,7 +29,12 @@ maintenance = ["duckdb>=1.3", "pytz"]
 
 [dependency-groups]
 # For running the examples and tests locally (not shipped to consumers).
-dev = ["duckdb>=1.5", "pytz", "pytest>=8"]
+dev = [
+    "duckdb>=1.5",
+    "pytz",
+    "pytest>=8",
+    "psycopg2-binary>=2.9.12",
+]
 
 [project.urls]
 Homepage = "https://github.com/phrrngtn/ducklake_oob_writer"

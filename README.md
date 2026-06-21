@@ -153,6 +153,33 @@ maintenance, and a Postgres-catalog variant. See [`examples/README.md`](examples
 - **Catalog protocol coupling** — the SQLAlchemy model tracks a specific DuckLake
   catalog version (`DUCKLAKE_VERSION`). See the design doc for 1.0 interop notes.
 
+## Concurrency
+
+The OOB writer assumes it is the **sole writer** of a catalog — it caches the
+catalog id counters (`next_snapshot_id` / `next_file_id` / `next_catalog_id`). It
+does **not** participate in DuckLake's own transaction/conflict protocol; it
+writes catalog rows directly. The implications (verified — see
+`examples/07_concurrent_reader.py` and `08_concurrent_writers.py`):
+
+| Scenario | SQLite catalog | Postgres catalog |
+|---|---|---|
+| **Readers** (any number of DuckDB attaches) while the OOB writer writes | ✅ safe — a live reader sees commits appear incrementally | ✅ safe (MVCC snapshot per reader transaction) |
+| **Serialized hand-off**: native DuckDB writes, then a *fresh* OOB writer continues | ✅ works (default journal) | ✅ works |
+| **Stale writer**: an external write lands between OOB operations | ✅ fails loud — `snapshot_id` PK → `IntegrityError` + rollback, **no corruption** | ✅ fails loud — `UniqueViolation` + rollback, **no corruption** |
+| **Concurrent writers / WAL** | ⚠️ a SQLite catalog in **WAL** mode that DuckDB *also writes* can be **corrupted** (two SQLite implementations on one WAL file) | ✅ no file-level hazard exists — the server arbitrates all writers |
+
+Guidance:
+
+- **One writer per catalog.** Funnel all producers (incl. federation feeders)
+  through a single OOB writer, or give each its own catalog/namespace and union on read.
+- If you must hand off to/from native DuckDB, **serialize** and **re-create** the
+  OOB writer afterwards (a fresh `DuckLakeWriter` re-reads the counters). A reused
+  instance with stale counters fails loudly (PK rollback) rather than corrupting.
+- For any shared/multi-writer setup, prefer a **Postgres catalog** — every failure
+  becomes a clean transaction conflict, and the SQLite-WAL corruption hazard is gone.
+- **Do not** put a SQLite catalog in WAL mode if DuckDB also writes it. (Readers
+  under WAL are fine; it's mixed *writers* that corrupt.)
+
 ## Consumers
 
 - [`rule4`](https://github.com/phrrngtn/rule4) — Socrata open-data scraping into DuckLake.
