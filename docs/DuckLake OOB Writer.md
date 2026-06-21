@@ -91,6 +91,36 @@ insert in a real ACID database — robust even over flaky shared filesystems
 (NFS/Spectrum Scale), because no filesystem rename/exclusive-create is on the
 commit path.
 
+## Maintenance & the compaction boundary
+
+Maintenance (compaction, expiring snapshots, GC) is **delegated to DuckLake's own
+engine**, and the package draws a hard line here:
+
+> **This package never reads, merges, or rewrites Parquet data files for
+> compaction.** The data-file work is done entirely by DuckDB's native `ducklake`
+> extension. `compact()` / `expire_snapshots()` / `cleanup_old_files()` each
+> `ATTACH` the catalog and issue a single `CALL ducklake_*(...)`.
+
+The package's *only* role in compaction is to **enable** it. DuckLake's native
+compaction planner reads statistics and contiguous row-id ranges that a naive OOB
+registration omits — so the writer emits them at registration time:
+
+- `ducklake_table_stats` — `record_count` / `next_row_id` / `file_size_bytes`,
+  maintained on `create_table` and every `register_data_file`.
+- contiguous `row_id_start` per file (the running `next_row_id`).
+- `ducklake_schema_versions.table_id` — set to the new table (a NULL here makes the
+  native planner read a NULL `uint64` and assert; this was the original blocker).
+- `ducklake_file_column_stats` — per-column counts/sizes/min/max, populated when
+  `column_stats` is supplied (e.g. by `register_parquet`).
+
+Reading a single Parquet file to *compute* those statistics (inside
+`register_parquet`) is metadata work, not compaction — the boundary is about never
+doing the data-file *merge/rewrite* in Python. The boundary and the correctness of
+native compaction over OOB-written files are enforced by
+`tests/test_native_compaction.py` (exact-data preservation across types + NULLs,
+real file reduction, valid merged Parquet, contiguous row-ids, time-travel, and
+re-append after compaction).
+
 ## Provenance
 
 Lineage rides on `ducklake_snapshot_changes.commit_extra_info` as a JSON string

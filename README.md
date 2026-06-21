@@ -113,6 +113,20 @@ that make them compactable. Files registered with the bare `register_data_file`
 and no `column_stats` are still queryable but not compactable; `run_maintenance`
 reports that in `summary["compact_error"]` instead of failing the pass.
 
+### Boundary
+
+**This package never reads, merges, or rewrites Parquet data files for
+compaction.** The actual data-file work is performed entirely by DuckDB's native
+`ducklake` engine — `compact`, `expire_snapshots`, and `cleanup_old_files` each
+just `ATTACH` the catalog and issue a single `CALL ducklake_*(...)`. The package's
+*only* contribution to compaction is to **enable** it: the writer emits the
+statistics and contiguous row-id ranges that DuckLake's native compaction planner
+requires, at registration time. (Reading one Parquet file to *compute* those
+statistics in `register_parquet` is metadata work, not compaction.) The boundary
+is enforced by `tests/test_native_compaction.py`, which also verifies native
+compaction of OOB-written files preserves data exactly, merges files, keeps
+row-ids contiguous, and leaves time-travel and re-append working.
+
 ## Examples
 
 Runnable demos in [`examples/`](examples/) (use the `dev` group for `duckdb`):

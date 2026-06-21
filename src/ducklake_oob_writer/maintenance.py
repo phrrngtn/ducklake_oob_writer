@@ -14,6 +14,19 @@ DuckDB's `ducklake` extension and CALL the native maintenance functions:
   * ``ducklake_expire_snapshots``      — drop old snapshots (ends time-travel to them)
   * ``ducklake_cleanup_old_files``     — delete files no longer referenced by any snapshot
 
+Boundary
+--------
+This package **never reads, merges, or rewrites Parquet data files for
+compaction**. The actual data-file work is done entirely by DuckDB's native
+``ducklake`` engine; the functions here only ``ATTACH`` the catalog and issue a
+single ``CALL ducklake_*(...)``. The package's *only* contribution to compaction
+is to *enable* it: the OOB writer emits, at registration time, the statistics and
+contiguous row-id ranges (``ducklake_table_stats``, ``ducklake_file_column_stats``,
+``row_id_start``, ``schema_versions.table_id``) that DuckLake's native compaction
+planner requires. (Reading a single Parquet file to *compute* those statistics in
+``DuckLakeWriter.register_parquet`` is metadata work, not compaction.) This boundary
+is enforced by ``tests/test_native_compaction.py``.
+
 This module needs the ``duckdb`` package, which is an optional dependency::
 
     uv add "ducklake-oob-writer[maintenance]"
