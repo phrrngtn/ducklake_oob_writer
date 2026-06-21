@@ -1,14 +1,14 @@
 """05 — Maintenance, delegated to DuckLake's own engine.
 
 `run_maintenance` attaches the catalog with DuckDB's `ducklake` extension and
-CALLs the native maintenance functions. On a pure-OOB catalog:
+CALLs the native maintenance functions: compact (merge small files), expire old
+snapshots, and clean up the now-orphaned files.
 
-  * expire_snapshots  — works (drop old snapshots / time-travel points)
-  * cleanup_old_files — works (GC files no longer referenced)
-  * compaction        — NOT yet supported: DuckLake's compaction planner needs
-                        per-column statistics + row-id ranges that the OOB writer
-                        does not emit. run_maintenance attempts it and reports the
-                        gap in summary["compact_error"] instead of failing.
+Compaction needs per-column statistics + row-id ranges. The `Lake` helper here
+registers via `register_parquet`, which emits those, so the files are
+compaction-ready. (Files registered with the bare `register_data_file` and no
+`column_stats` are queryable but not compactable — `run_maintenance` reports that
+in `summary["compact_error"]` instead of failing.)
 
     uv run --group dev python examples/05_maintenance.py
 """
@@ -34,8 +34,7 @@ before_rows = con.execute("SELECT count(*) FROM lake.ticks").fetchone()[0]
 con.close()
 print(f"before: {len(lake.data_files())} Parquet files, {before_rows} rows")
 
-# Expire snapshots older than 00:06 (by SOURCE time), then cleanup. Compaction is
-# attempted and gracefully reported as unsupported on a pure-OOB catalog.
+# Compact, expire snapshots older than 00:06 (by SOURCE time), then cleanup.
 lake.release()
 summary = dl.run_maintenance(lake.catalog, str(lake.data_path),
                              older_than=dt.datetime(2026, 6, 20, 0, 6, 0))
@@ -47,5 +46,4 @@ con = lake.reader()
 after_rows = con.execute("SELECT count(*) FROM lake.ticks").fetchone()[0]
 con.close()
 print(f"\nafter:  {len(lake.data_files())} Parquet files, {after_rows} rows (current state preserved)")
-print("\n=> expire + cleanup ran cleanly; compaction is reported as a known gap")
-print("   (the OOB writer needs to emit column/row-id stats — see compact() docstring).")
+print("\n=> 12 tiny files compacted to 1; old snapshots expired; orphaned files cleaned.")

@@ -37,7 +37,8 @@ The headline reason is **carrying the source's transaction-time onto the DuckLak
 |--------|-------------|
 | `init_catalog(data_path, version=DUCKLAKE_VERSION, author=None)` | One-time bootstrap: snapshot 0, `main` schema, metadata |
 | `create_table(schema_name, table_name, columns, snapshot_time=None, ...)` | Register a new table + columns (`columns` = list of `(name, ducklake_type)`) |
-| `register_data_file(table_name, path, record_count, file_size_bytes, footer_size, snapshot_time=None, ...)` | Register a Parquet data file (`path` is **relative to the table directory**) |
+| `register_data_file(table_name, path, record_count, file_size_bytes, footer_size, snapshot_time=None, column_stats=None, ...)` | Register a Parquet data file (`path` is **relative to the table directory**); pass `column_stats` for compaction-readiness |
+| `register_parquet(table_name, fs_path, snapshot_time=None, ...)` | Convenience: read an on-disk Parquet file and register it **compaction-ready** (computes size/footer/record-count/column-stats via DuckDB) |
 | `current_tables()` / `current_columns(table)` / `snapshots()` | Introspection |
 
 ## Installation
@@ -98,17 +99,19 @@ summary = dl.run_maintenance("sqlite:/lake/catalog.sqlite", "/lake/data",
                              older_than="2026-01-01")   # expire+cleanup; compaction attempted
 ```
 
-| Function | On a pure-OOB catalog |
-|----------|------------------------|
+| Function | On an OOB catalog |
+|----------|-------------------|
 | `expire_snapshots(catalog, data_path, older_than=...)` | ✅ works |
 | `cleanup_old_files(catalog, data_path)` | ✅ works |
-| `compact(catalog, data_path)` | ⚠️ **not yet supported** — see below |
+| `compact(catalog, data_path)` | ✅ works for **compaction-ready** files (see below) |
 
-**Compaction caveat.** `ducklake_merge_adjacent_files` reads per-column statistics
-and row-id ranges that the OOB writer does not currently emit, so on a pure-OOB
-catalog `compact()` raises a DuckDB `InternalException`. `run_maintenance` attempts
-it and reports the gap in `summary["compact_error"]` rather than failing the pass.
-Emitting those statistics at registration time is a roadmap item.
+**Compaction readiness.** `ducklake_merge_adjacent_files` reads per-column
+statistics and contiguous row-id ranges. Register files with
+**`register_parquet`** (or `register_data_file(column_stats=...)`) and the writer
+emits `ducklake_table_stats`, `ducklake_file_column_stats`, and the row-id ranges
+that make them compactable. Files registered with the bare `register_data_file`
+and no `column_stats` are still queryable but not compactable; `run_maintenance`
+reports that in `summary["compact_error"]` instead of failing the pass.
 
 ## Examples
 

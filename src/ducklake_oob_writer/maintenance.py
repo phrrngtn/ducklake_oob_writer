@@ -89,14 +89,14 @@ def attach_lake(catalog: str, data_path: str, *, alias: str = _ALIAS,
 def compact(catalog: str, data_path: str, *, con=None) -> None:
     """Compact adjacent small Parquet files into larger ones.
 
-    LIMITATION: DuckLake's compaction planner reads per-column statistics
-    (``ducklake_table_column_stats`` / ``ducklake_file_column_stats``) and
-    contiguous row-id ranges. The OOB writer currently registers files *without*
-    those, so on a pure-OOB catalog this raises a DuckDB ``InternalException``
-    ("GetValueInternal on a value that is NULL"). It works on catalogs that
-    DuckLake itself has written/compacted. Emitting the missing statistics at
-    registration time is a roadmap item; until then, prefer :func:`expire_snapshots`
-    and :func:`cleanup_old_files`, which do not need them.
+    Requires that the files were registered **compaction-ready** — i.e. with
+    per-column statistics and contiguous row-id ranges. Use
+    ``DuckLakeWriter.register_parquet`` (or ``register_data_file(column_stats=...)``)
+    for that. Files registered with the bare ``register_data_file`` and no
+    ``column_stats`` lack the per-file statistics DuckLake's compaction planner
+    reads, and this will raise a DuckDB ``InternalException``
+    ("GetValueInternal on a value that is NULL"). :func:`expire_snapshots` and
+    :func:`cleanup_old_files` do not need the statistics and work either way.
     """
     with attach_lake(catalog, data_path, con=con) as c:
         c.execute(f"CALL ducklake_merge_adjacent_files('{_ALIAS}')")
@@ -138,11 +138,11 @@ def run_maintenance(catalog: str, data_path: str, *, older_than=None,
     others. ``expire_snapshots`` runs only if ``older_than`` is given
     (history-preserving by default).
 
-    **Compaction caveat:** ``ducklake_merge_adjacent_files`` requires column
-    statistics and row-id ranges that the OOB writer does not yet emit (see
-    :func:`compact`). On a pure-OOB catalog it raises; ``run_maintenance`` catches
-    that and records it in ``summary["compact_error"]`` rather than failing the
-    whole pass. Set ``attempt_compaction=False`` to skip it entirely.
+    **Compaction note:** ``ducklake_merge_adjacent_files`` requires files
+    registered compaction-ready (via ``register_parquet`` / ``column_stats``; see
+    :func:`compact`). For files registered without statistics it raises;
+    ``run_maintenance`` catches that and records it in ``summary["compact_error"]``
+    rather than failing the whole pass. Set ``attempt_compaction=False`` to skip it.
 
     Returns a summary dict: ``compacted``, ``compact_error``, ``expired``,
     ``cleaned_files``.

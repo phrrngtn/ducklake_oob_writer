@@ -48,11 +48,9 @@ class Lake:
         c.execute(f"COPY ({select_sql}) TO '{phys}' (FORMAT PARQUET)")
         n = c.execute(f"SELECT count(*) FROM read_parquet('{phys}')").fetchone()[0]
         c.close()
-        fsize, footer = dl.footer_and_size(str(phys))
-        self.writer.register_data_file(
-            table, path=fname, record_count=n,
-            file_size_bytes=fsize, footer_size=footer, snapshot_time=snapshot_time,
-        )
+        # register_parquet computes footer/size/record_count + per-column stats
+        # from the file, so the registration is compaction-ready.
+        self.writer.register_parquet(table, str(phys), snapshot_time=snapshot_time)
         return n
 
     def release(self):

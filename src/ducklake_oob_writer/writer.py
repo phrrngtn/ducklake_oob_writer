@@ -121,6 +121,14 @@ class DuckLakeWriter:
     def _table_stats(self):
         return self._t["ducklake_table_stats"]
 
+    @property
+    def _table_column_stats(self):
+        return self._t["ducklake_table_column_stats"]
+
+    @property
+    def _file_column_stats(self):
+        return self._t["ducklake_file_column_stats"]
+
     # ── Counter management ─────────────────────────────────────────────
 
     def _load_state(self, conn):
@@ -296,11 +304,13 @@ class DuckLakeWriter:
                 next_file_id=self._next_file_id,
             ))
 
-            # Schema version
+            # Schema version — record the table this version introduced (native
+            # DuckLake sets table_id here; a NULL makes the compaction planner
+            # read a NULL uint64 and crash).
             conn.execute(self._schema_versions.insert().values(
                 begin_snapshot=snapshot_id,
                 schema_version=self._schema_version,
-                table_id=None,
+                table_id=table_id,
             ))
 
             # Table
@@ -356,6 +366,11 @@ class DuckLakeWriter:
                 commit_extra_info=commit_extra_info,
             ))
 
+            # Initialise per-table stats (record_count / next_row_id / file_size_bytes)
+            # so files registered later can maintain it and stay compaction-ready.
+            conn.execute(self._table_stats.insert().values(
+                table_id=table_id, record_count=0, next_row_id=0, file_size_bytes=0))
+
         return {
             "table_id": table_id,
             "snapshot_id": snapshot_id,
@@ -365,8 +380,13 @@ class DuckLakeWriter:
     def register_data_file(self, table_name, path, record_count,
                            file_size_bytes, footer_size,
                            snapshot_time=None, author=None,
-                           commit_message=None, schema_name="main"):
+                           commit_message=None, schema_name="main",
+                           column_stats=None):
         """Register a Parquet data file for an existing table.
+
+        Maintains ``ducklake_table_stats`` (record_count / next_row_id /
+        file_size_bytes) and assigns a contiguous ``row_id_start`` so the catalog
+        stays consistent for DuckLake's planner.
 
         Args:
             table_name: Table to register the file for
@@ -378,9 +398,16 @@ class DuckLakeWriter:
             author: Optional author string
             commit_message: Optional commit message
             schema_name: Schema name (default "main")
+            column_stats: Optional per-column statistics to populate
+                ``ducklake_file_column_stats``, which makes the file
+                **compaction-ready**. Either a dict ``{column_name: stats}`` or a
+                list ``[(column_name, stats), ...]``; each ``stats`` is the dict
+                returned by :func:`ducklake_oob_writer.parquet.column_stats`
+                (value_count, null_count, column_size_bytes, min_value, max_value,
+                contains_nan). Without it, the file is queryable but not compactable.
 
         Returns:
-            dict with data_file_id, snapshot_id
+            dict with data_file_id, snapshot_id, row_id_start
         """
         with self.engine.begin() as conn:
             self._load_state(conn)
@@ -388,6 +415,16 @@ class DuckLakeWriter:
             table_id = self._find_table_id(conn, table_name, schema_name)
             snapshot_id = self._alloc_snapshot_id()
             file_id = self._alloc_file_id()
+
+            # Read (and later advance) per-table stats. row_id_start is the running
+            # next_row_id so row-id ranges are contiguous across files.
+            ts = self._table_stats
+            ts_row = conn.execute(
+                select(ts.c.record_count, ts.c.next_row_id, ts.c.file_size_bytes)
+                .where(ts.c.table_id == table_id)
+            ).fetchone()
+            cur_rc, cur_next, cur_size = ts_row if ts_row else (0, 0, 0)
+            row_id_start = cur_next
 
             # Snapshot
             conn.execute(self._snapshot.insert().values(
@@ -411,12 +448,51 @@ class DuckLakeWriter:
                 record_count=record_count,
                 file_size_bytes=file_size_bytes,
                 footer_size=footer_size,
-                row_id_start=0,
+                row_id_start=row_id_start,
                 partition_id=None,
                 encryption_key=None,
                 mapping_id=None,
                 partial_max=None,
             ))
+
+            # Advance table stats
+            new_vals = dict(record_count=cur_rc + record_count,
+                            next_row_id=cur_next + record_count,
+                            file_size_bytes=cur_size + file_size_bytes)
+            if ts_row:
+                conn.execute(ts.update().where(ts.c.table_id == table_id).values(**new_vals))
+            else:
+                conn.execute(ts.insert().values(table_id=table_id, **new_vals))
+
+            # Per-file column stats (optional; makes the file compaction-ready)
+            if column_stats:
+                items = (list(column_stats.items())
+                         if isinstance(column_stats, dict) else list(column_stats))
+                col = self._column
+                name_to_id = {
+                    n: i for i, n in conn.execute(
+                        select(col.c.column_id, col.c.column_name)
+                        .where(and_(col.c.table_id == table_id,
+                                    col.c.end_snapshot.is_(None)))
+                    ).fetchall()
+                }
+                rows = []
+                for cname, st in items:
+                    cid = name_to_id.get(cname)
+                    if cid is None:
+                        continue
+                    rows.append(dict(
+                        data_file_id=file_id, table_id=table_id, column_id=cid,
+                        column_size_bytes=st.get("column_size_bytes"),
+                        value_count=st.get("value_count"),
+                        null_count=st.get("null_count"),
+                        min_value=st.get("min_value"),
+                        max_value=st.get("max_value"),
+                        contains_nan=st.get("contains_nan"),
+                        extra_stats=None,
+                    ))
+                if rows:
+                    conn.execute(self._file_column_stats.insert(), rows)
 
             # Snapshot changes
             conn.execute(self._snapshot_changes.insert().values(
@@ -427,7 +503,44 @@ class DuckLakeWriter:
                 commit_extra_info=None,
             ))
 
-        return {"data_file_id": file_id, "snapshot_id": snapshot_id}
+        return {"data_file_id": file_id, "snapshot_id": snapshot_id, "row_id_start": row_id_start}
+
+    def register_parquet(self, table_name, fs_path, *, rel_path=None,
+                         snapshot_time=None, author=None, commit_message=None,
+                         schema_name="main", with_column_stats=True):
+        """Register an on-disk Parquet file, computing everything needed for a
+        **compaction-ready** registration (footer size, file size, record count,
+        and per-column statistics) from the file itself.
+
+        Requires the ``duckdb`` package (the stats read the file). For the
+        dependency-free path, compute these yourself and call
+        :meth:`register_data_file` directly.
+
+        Args:
+            fs_path: filesystem path to the Parquet file to read.
+            rel_path: path recorded in the catalog, relative to the table dir;
+                defaults to the file's basename (the standard one-file-per-table-dir
+                layout).
+            with_column_stats: populate ``file_column_stats`` (compaction-ready).
+        """
+        import os
+
+        from ducklake_oob_writer.parquet import column_stats as _column_stats
+        from ducklake_oob_writer.parquet import footer_and_size
+
+        file_size_bytes, footer_size = footer_and_size(fs_path)
+        if with_column_stats:
+            record_count, cstats = _column_stats(fs_path)
+        else:
+            import duckdb
+            record_count = duckdb.connect().execute(
+                "SELECT count(*) FROM read_parquet(?)", [fs_path]).fetchone()[0]
+            cstats = None
+        return self.register_data_file(
+            table_name, path=rel_path or os.path.basename(fs_path),
+            record_count=record_count, file_size_bytes=file_size_bytes,
+            footer_size=footer_size, snapshot_time=snapshot_time, author=author,
+            commit_message=commit_message, schema_name=schema_name, column_stats=cstats)
 
     def current_tables(self):
         """List all current (non-deleted) tables.
