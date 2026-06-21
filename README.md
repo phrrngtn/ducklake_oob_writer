@@ -141,6 +141,34 @@ uv run --group dev python examples/01_quickstart.py
 Covers quickstart, source-time time-travel, late-arriving backfill, merge-on-read,
 maintenance, and a Postgres-catalog variant. See [`examples/README.md`](examples/README.md).
 
+## Object storage (S3)
+
+Data paths can be object-store URIs (`s3://…`, including MinIO), not just local
+disk. DuckDB (`httpfs`) does the Parquet read/write; `footer_and_size` reads the
+footer via `fsspec`/`s3fs` — the optional **`[s3]` extra**
+(`uv add "ducklake-oob-writer[s3]"`).
+
+The package stays **auth-agnostic**: you configure credentials on the DuckDB
+connection you hand it, so static keys, `PROVIDER credential_chain`, or STS
+temp-creds (e.g. MinIO `AssumeRoleWithCertificate` via a `credential_process`) all
+work without any package change.
+
+```python
+so = {"key": KEY, "secret": SECRET, "client_kwargs": {"endpoint_url": "http://host:9000"}}
+con = duckdb.connect()
+con.execute("INSTALL httpfs; LOAD httpfs;")
+con.execute("CREATE SECRET (TYPE s3, KEY_ID '…', SECRET '…', "
+            "ENDPOINT 'host:9000', URL_STYLE 'path', USE_SSL false)")
+
+w.init_catalog(data_path="s3://bucket/data")
+con.execute("COPY (SELECT …) TO 's3://bucket/data/main/t/batch.parquet' (FORMAT PARQUET)")
+w.register_parquet("t", "s3://bucket/data/main/t/batch.parquet",
+                   con=con, storage_options=so, snapshot_time=src_ts)
+```
+
+`register_data_file`/`register_parquet`/`footer_and_size`/`column_stats` take
+`con` and/or `storage_options` for remote paths; local paths need neither.
+
 ## Dependencies
 
 - **Runtime:** `sqlalchemy >= 2.0` (only).

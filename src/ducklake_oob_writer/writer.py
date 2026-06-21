@@ -507,33 +507,41 @@ class DuckLakeWriter:
 
     def register_parquet(self, table_name, fs_path, *, rel_path=None,
                          snapshot_time=None, author=None, commit_message=None,
-                         schema_name="main", with_column_stats=True):
-        """Register an on-disk Parquet file, computing everything needed for a
-        **compaction-ready** registration (footer size, file size, record count,
-        and per-column statistics) from the file itself.
+                         schema_name="main", with_column_stats=True,
+                         con=None, storage_options=None):
+        """Register a Parquet file, computing footer size, file size, record count,
+        and per-column (query-pruning) statistics from the file itself.
 
         Requires the ``duckdb`` package (the stats read the file). For the
         dependency-free path, compute these yourself and call
         :meth:`register_data_file` directly.
 
+        Works for local paths and object-store URIs (``s3://…``). For remote paths:
+          * pass ``con`` — a DuckDB connection that already has ``httpfs`` loaded
+            and the S3 secret created (used to read record count + column stats);
+          * pass ``storage_options`` — an fsspec config used by ``footer_and_size``
+            (e.g. MinIO: ``{"key": …, "secret": …, "client_kwargs":
+            {"endpoint_url": "http://host:9000"}}``). Needs the ``[s3]`` extra.
+
         Args:
-            fs_path: filesystem path to the Parquet file to read.
+            fs_path: path to the Parquet file to read (local or ``s3://…``).
             rel_path: path recorded in the catalog, relative to the table dir;
                 defaults to the file's basename (the standard one-file-per-table-dir
                 layout).
-            with_column_stats: populate ``file_column_stats`` (compaction-ready).
+            with_column_stats: populate ``file_column_stats`` (query pruning).
         """
         import os
 
         from ducklake_oob_writer.parquet import column_stats as _column_stats
         from ducklake_oob_writer.parquet import footer_and_size
 
-        file_size_bytes, footer_size = footer_and_size(fs_path)
+        file_size_bytes, footer_size = footer_and_size(fs_path, storage_options=storage_options)
         if with_column_stats:
-            record_count, cstats = _column_stats(fs_path)
+            record_count, cstats = _column_stats(fs_path, con=con)
         else:
             import duckdb
-            record_count = duckdb.connect().execute(
+            c = con or duckdb.connect()
+            record_count = c.execute(
                 "SELECT count(*) FROM read_parquet(?)", [fs_path]).fetchone()[0]
             cstats = None
         return self.register_data_file(

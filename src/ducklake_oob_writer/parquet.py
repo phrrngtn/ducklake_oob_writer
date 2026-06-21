@@ -17,37 +17,66 @@ import struct
 __all__ = ["footer_and_size", "column_stats"]
 
 
-def footer_and_size(path: str) -> tuple[int, int]:
-    """Return ``(file_size_bytes, footer_size)`` for a Parquet file on local disk.
+def _is_remote(path: str) -> bool:
+    """True for object-store / remote URIs (s3://, gs://, …), False for local/file://."""
+    i = path.find("://")
+    return i != -1 and path[:i] != "file"
+
+
+def _footer_from_tail(path: str, tail: bytes, size: int) -> tuple[int, int]:
+    footer_size = struct.unpack("<i", tail[:4])[0]
+    if tail[4:] != b"PAR1":
+        raise ValueError(f"{path}: not a Parquet file (missing PAR1 magic)")
+    return int(size), footer_size
+
+
+def footer_and_size(path: str, storage_options: dict | None = None) -> tuple[int, int]:
+    """Return ``(file_size_bytes, footer_size)`` for a Parquet file.
+
+    Works for local paths (stdlib) and object-store URIs like ``s3://…`` (via
+    ``fsspec``/``s3fs`` — the optional ``[s3]`` extra). ``storage_options`` is
+    passed to fsspec for remote paths (e.g. MinIO: ``{"key": …, "secret": …,
+    "client_kwargs": {"endpoint_url": "http://host:9000"}}``).
 
     Raises ValueError if the file is not a valid Parquet file (missing PAR1 magic).
     """
-    file_size_bytes = os.path.getsize(path)
+    if _is_remote(path):
+        import fsspec  # lazy: only needed for remote paths (optional [s3] extra)
+
+        fs, _, paths = fsspec.get_fs_token_paths(path, storage_options=storage_options or {})
+        rp = paths[0]
+        size = fs.size(rp)
+        with fs.open(rp, "rb") as f:
+            f.seek(size - 8)
+            tail = f.read(8)
+        return _footer_from_tail(path, tail, size)
+
+    size = os.path.getsize(path)
     with open(path, "rb") as f:
         f.seek(-8, os.SEEK_END)
-        footer_size = struct.unpack("<i", f.read(4))[0]
-        if f.read(4) != b"PAR1":
-            raise ValueError(f"{path}: not a Parquet file (missing PAR1 magic)")
-    return file_size_bytes, footer_size
+        tail = f.read(8)
+    return _footer_from_tail(path, tail, size)
 
 
-def column_stats(path: str):
-    """Compute the per-column statistics DuckLake needs to make a file
-    compaction-ready: ``(record_count, [(column_name, stats), ...])`` in schema
-    order, where ``stats`` has ``value_count``, ``null_count``,
-    ``column_size_bytes``, ``min_value``, ``max_value``, ``contains_nan``.
+def column_stats(path: str, con=None):
+    """Compute the per-column statistics for query pruning:
+    ``(record_count, [(column_name, stats), ...])`` in schema order, where
+    ``stats`` has ``value_count``, ``null_count``, ``column_size_bytes``,
+    ``min_value``, ``max_value``, ``contains_nan``.
 
     Reads the Parquet file with DuckDB (lazy import), so this is **not** part of
-    the dependency-free core — call it from a context that already has duckdb
-    (and pass the result to ``DuckLakeWriter.register_data_file(column_stats=...)``,
-    or just use ``DuckLakeWriter.register_parquet`` which calls this for you).
+    the dependency-free core. For object-store paths (``s3://…``) pass a ``con``
+    that already has ``httpfs`` loaded and the S3 secret created; a fresh local
+    connection is used otherwise.
 
     min/max are stored as DuckDB's ``CAST(... AS VARCHAR)`` form, which is the
     same encoding DuckLake itself uses.
     """
-    import duckdb  # lazy
+    own = con is None
+    if own:
+        import duckdb  # lazy
 
-    con = duckdb.connect()
+        con = duckdb.connect()
     try:
         schema = con.execute("DESCRIBE SELECT * FROM read_parquet(?)", [path]).fetchall()
         total = con.execute("SELECT count(*) FROM read_parquet(?)", [path]).fetchone()[0]
@@ -80,4 +109,5 @@ def column_stats(path: str):
             }))
         return int(total), out
     finally:
-        con.close()
+        if own:
+            con.close()
