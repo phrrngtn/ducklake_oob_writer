@@ -26,6 +26,16 @@ The fix is **automatic**: `register_data_file` keeps `snapshot_id` order aligned
 
 This — together with the **path-vs-rewrite dimension encoding** for partition/pruning columns, and the surrogate-vs-natural-key reasoning behind the whole approach — is written up in full in **[`docs/Temporal and Partitioning Design.md`](docs/Temporal%20and%20Partitioning%20Design.md)**.
 
+## Inlined data — small writes with no files
+
+For small, frequent arrivals (e.g. **CDC/CT polling since a high-water mark**) a tiny Parquet file per batch is the wrong move — it creates the small-files problem. DuckLake's answer is **data inlining**: the rows live *directly in the catalog database* (in `ducklake_inlined_data_<table_id>_<schema_version>`, with MVCC bookkeeping `row_id` / `begin_snapshot` / `end_snapshot`), and reads union them with the table's Parquet files.
+
+`inline_rows(table, rows)` writes them **out-of-band with nothing but SQLAlchemy** — no Parquet, no DuckDB, no object store. A process with only a database connection can populate a queryable lake. It auto-canonicalizes (so an **out-of-order inlined backfill** — the CDC late-arrival — time-travels correctly), and you later **squish the inlined rows down to Parquet** with the native `CALL ducklake_flush_inlined_data('lake')`, then compact with `ducklake_merge_adjacent_files`. The whole loop: *poll-since-HWM → `inline_rows` → flush*.
+
+**Scalar / simple-typed columns only** — int, double, varchar, boolean, decimal, date/time/timestamp. A nested column (`LIST`/`STRUCT`/`MAP`) raises: route those through Parquet, where types are exact and portable.
+
+Why the restriction: inlined data is rows in the catalog DB, so values must fit its columns. In the normal path **DuckDB is both the writer and the reader** of inlined data — it stores non-native types as *its own* `CAST(… AS VARCHAR)` text and parses that back, self-consistent. The OOB writer is the unusual writer, so it must **reproduce DuckDB's representation, not invent one**. For the simple types Python's `str()` reproduces it *byte-for-byte* — a differential test writes the same rows via native DuckDB and via `inline_rows` and asserts the catalog is identical. Nested types serialize to DuckDB's bespoke literal form (`[x, y]`, `{'a': 1}`), not safe to reproduce from outside the engine — hence refused.
+
 ## API reference
 
 | Name | Kind | Description |
@@ -47,6 +57,7 @@ This — together with the **path-vs-rewrite dimension encoding** for partition/
 | `create_table(schema_name, table_name, columns, snapshot_time=None, ...)` | Register a new table + columns (`columns` = list of `(name, ducklake_type)`) |
 | `register_data_file(table_name, path, record_count, file_size_bytes, footer_size, snapshot_time=None, column_stats=None, ...)` | Register a Parquet data file. A bare `path` is **relative to the table directory** under `DATA_PATH`; an **absolute path or URI** (`s3://…`, `gs://…`, `/abs/…`) is stored verbatim (`path_is_relative=False`) so one catalog can union files **scattered across backends** (the reader just needs a secret per endpoint). Pass `column_stats` to add query-pruning stats |
 | `register_parquet(table_name, fs_path, snapshot_time=None, ...)` | Convenience: read an on-disk Parquet file and register it, computing size/footer/record-count + per-column *pruning* stats via DuckDB |
+| `inline_rows(table_name, rows, snapshot_time=None, ...)` | Write rows **straight into the catalog** as DuckLake inlined data — **no Parquet, no DuckDB** — for small/frequent arrivals (CDC/CT). Scalar/simple-typed columns only; flush to Parquet later with the native `ducklake_flush_inlined_data` |
 | `current_tables()` / `current_columns(table)` / `snapshots()` | Introspection |
 
 ## Installation

@@ -148,6 +148,41 @@ a lake of `register_virtual` files (`test_canonicalize_mapping.py`).
 
 ---
 
+## 4. Inlined data: rows in the catalog, no files
+
+For **small, frequent arrivals** (CDC/CT polling since a HWM), a Parquet file per batch
+is the small-files anti-pattern. DuckLake's answer is **inlining**: rows live directly
+in the catalog DB, in `ducklake_inlined_data_<table_id>_<schema_version>` (MVCC columns
+`row_id` / `begin_snapshot` / `end_snapshot` + the table's columns), registered in
+`ducklake_inlined_data_tables`; the snapshot logs `inlined_insert:<table_id>`. Reads
+union the inlined rows with the table's Parquet; `ducklake_flush_inlined_data` squishes
+them to a Parquet file (then `ducklake_merge_adjacent_files` compacts). `inline_rows`
+writes all this as **pure SQLAlchemy** — no Parquet, no DuckDB, no object store. The CDC
+loop is *poll-since-HWM → inline → flush*.
+
+**This is governed by "mimic the native writer, don't invent"** (the OOB writer is
+DuckDB's write path reimplemented from outside; the DuckDB reader expects DuckDB's
+format). Two consequences:
+
+- **Type serialization.** Inlined values must fit the catalog DB's columns. In the
+  normal path DuckDB owns *both* ends — it stores non-native types (decimal, timestamp,
+  …) as its own `CAST(… AS VARCHAR)` text and parses it back. So OOB must reproduce that
+  text. For scalar / decimal / temporal types Python `str()` reproduces it **byte-for-
+  byte** — asserted by a *differential test* that writes the same rows via native DuckDB
+  and via `inline_rows` and diffs the catalog (`test_inline.py`). Nested types
+  (`LIST`/`STRUCT`/`MAP`) serialize to DuckDB's bespoke literal form (`[x, y]`,
+  `{'a': 1}`), not safe to reproduce from outside — so `inline_rows` **refuses them**
+  (route through Parquet). A DuckDB-as-coercion-oracle path could lift that limit but
+  isn't worth the dependency; the restriction stands.
+- **Temporal order.** An inlined insert writes *no* `ducklake_data_file` row, so
+  `recanonicalize` detects data snapshots from the change log
+  (`inserted_into_table:% | inlined_insert:%`), not from `ducklake_data_file`; and it
+  remaps `begin/end_snapshot` in the dynamic inlined tables too. So an **out-of-order
+  inlined backfill** (the CDC late arrival) self-canonicalizes and time-travels right
+  (`test_inline.py::…self_canonicalizes`).
+
+---
+
 ## Status
 
 | piece | state |
@@ -157,6 +192,8 @@ a lake of `register_virtual` files (`test_canonicalize_mapping.py`).
 | Relocate-style `register_virtual` (hive `name_mapping`) | **implemented** + round-trip tested (materialize + prune from the path; no rewrite) |
 | Automatic canonicalization inside `register_data_file` (runs in the write transaction) | **implemented** + tested |
 | Content-hash incorporation log (`oob_incorporation`: both clocks + hash) + `lake_as_known_at` | **implemented** + tested |
+| Heterogeneous file locations (absolute URIs / `path_is_relative=False`; one catalog, many backends) | **implemented** + tested |
+| Inlined data (`inline_rows`: rows in the catalog, no Parquet/DuckDB) — scalar/simple types; OOO-safe; flush to Parquet natively | **implemented** + tested (differential vs native DuckDB) |
 | Generalizing the fold over deletes / replacements / schema changes | open — needs per-event identity + ordering semantics |
 
 Deletes/replacements/schema-changes are also events; the clean append/incorporate
