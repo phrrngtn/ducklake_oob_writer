@@ -151,3 +151,53 @@ alongside `register_virtual`.
 Deletes/replacements/schema-changes are also events; the clean append/incorporate
 story above assumes one artifact = one add-event, and the general case needs each
 mutation to carry its own stable identity before the fold is fully general.
+
+---
+
+## Multi-tenancy: one lake per metadata schema (decided)
+
+Many independent lakes share one catalog *backend* by giving each its own
+**metadata schema** — DuckLake's native `METADATA_SCHEMA` on `ATTACH`, and the
+writer's existing `create_catalog(engine, schema=…)`. Each lake stays
+single-tenant and pristine; `DROP SCHEMA … CASCADE` reaps one cleanly. No
+database-per-lake, no `TRUNCATE`, no superposition. This is a zero-code decision —
+the mechanism already exists on both sides.
+
+**Rejected — row-level tenancy** (widening `ducklake_*` with a `lake_id`): the
+native reader issues *unqualified* `SELECT … FROM ducklake_data_file`, so it would
+read every tenant's files as one mixed lake. It breaks native compatibility, and —
+since you'd need per-lake filtered views to repair it — doesn't even save the
+per-lake DDL it was meant to avoid.
+
+**Deferred — a catalog-of-lakes registry** (the catalog-service / metastore
+pattern; a directory *of* catalogs, which DuckLake deliberately doesn't provide).
+Would own discovery, ownership, and ad-hoc-lake lifecycle (TTL + GC), scraping each
+lake's `ducklake_*` (plain SQL) for a summary. Worth building only once *managing
+many lakes* is an actual problem — not yet.
+
+## Deferred by design — recorded, not built (avoid over-engineering)
+
+Captured so the *problem* is on record, but **not implemented** until the problem
+is demonstrated, and kept out so the writer stays a small, comprehensible core:
+
+- **Incorporation validation — "don't record crap."** *Problem:* bad inputs or
+  lying stats silently corrupt query results / pruning. *Guards (when needed):* the
+  Parquet actually reads and exists at the recorded path; declared columns present
+  with compatible types; a partition/dimension column genuinely constant (`min==max`
+  — already enforced); **content-hash dedup** so the same artifact twice is a no-op
+  (idempotence); stats *derived from the file*, never trusted from a caller; a
+  *plausible* `transaction_time` (the "no later than N" bound reused as a
+  data-validation guard, **not** a performance watermark).
+- **Synchronous canonicalization on out-of-order arrival.** *Problem:* DuckLake's
+  surrogate-ordering redundancy turning valid data into wrong `AT (TIMESTAMP)`
+  answers. *When needed:* after incorporating a fact whose `transaction_time`
+  precedes an existing one, run `recanonicalize` and swap atomically so `snapshot_id`
+  order always matches `snapshot_time` order. The *mechanism* (`recanonicalize`) is
+  built; only the automatic *trigger* is deferred.
+
+**Explicitly NOT built (lily-gilding for a regime we don't have):** the append-only
+event log, watermark-gated *splice* canonicalization, and derived-catalog
+catch-up. At hours/days incorporation cadence over cheap metadata, the synchronous
+full-replay `recanonicalize` is both simpler and always-consistent — no inconsistency
+window. The guiding principle is to keep the OOB writer minimal and resist adding
+machinery before a real problem motivates it.
