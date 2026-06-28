@@ -66,6 +66,52 @@ def _is_absolute_uri(path):
     return "://" in path or path.startswith("/")
 
 
+# DuckLake scalar types the metadata backend stores natively in an inlined data table
+# (keys are the uppercased DuckLake/DuckDB type names — int widths all land in BIGINT).
+_INLINE_NATIVE = {
+    "BIGINT": "BIGINT", "INTEGER": "BIGINT", "INT": "BIGINT", "SMALLINT": "BIGINT",
+    "TINYINT": "BIGINT", "HUGEINT": "BIGINT",
+    "INT8": "BIGINT", "INT16": "BIGINT", "INT32": "BIGINT", "INT64": "BIGINT",
+    "UINT8": "BIGINT", "UINT16": "BIGINT", "UINT32": "BIGINT", "UINT64": "BIGINT",
+    "UBIGINT": "BIGINT", "UINTEGER": "BIGINT", "USMALLINT": "BIGINT", "UTINYINT": "BIGINT",
+    "DOUBLE": "DOUBLE", "FLOAT": "DOUBLE", "REAL": "DOUBLE",
+    "FLOAT4": "DOUBLE", "FLOAT8": "DOUBLE", "FLOAT32": "DOUBLE", "FLOAT64": "DOUBLE",
+    "VARCHAR": "VARCHAR", "TEXT": "VARCHAR", "STRING": "VARCHAR",
+    "BOOLEAN": "BOOLEAN", "BOOL": "BOOLEAN",
+}
+# Types DuckLake inlines as VARCHAR text (its own textual representation), parsed on read.
+_INLINE_TEXT = ("DECIMAL", "NUMERIC", "DATE", "TIMESTAMP", "TIME")
+
+
+def _ducklake_type_base(ctype):
+    return ctype.upper().split("(", 1)[0].strip()
+
+
+def _is_nested_type(ctype):
+    u = ctype.upper()
+    return u.endswith("[]") or any(t in u for t in ("STRUCT", "MAP", "UNION", "LIST"))
+
+
+def _inline_storage_type(ctype):
+    """Backend column type for an inlined column — native for backend-storable scalars,
+    VARCHAR (DuckLake's text form) for decimal/temporal."""
+    base = _ducklake_type_base(ctype)
+    if base in _INLINE_NATIVE:
+        return _INLINE_NATIVE[base]
+    if base in _INLINE_TEXT:
+        return "VARCHAR"
+    raise ValueError(f"inline_rows: unsupported column type {ctype!r} — inline only "
+                     f"scalar/simple types; register such a table as Parquet instead")
+
+
+def _inline_value(ctype, v):
+    """Format a value for its inlined column: native scalars as-is, decimal/temporal as
+    their canonical text (matching DuckLake's text serialization, which `str()` yields)."""
+    if v is None:
+        return None
+    return v if _ducklake_type_base(ctype) in _INLINE_NATIVE else str(v)
+
+
 class DuckLakeWriter:
     """OOB writer for DuckLake metadata tables via SA expression API.
 
@@ -794,6 +840,95 @@ class DuckLakeWriter:
                          .where(self._data_file.c.data_file_id == info["data_file_id"])
                          .values(mapping_id=mapping_id))
         return {**info, "mapping_id": mapping_id, "virtual": hive}
+
+    def inline_rows(self, table_name, rows, *, schema_name="main", snapshot_time=None,
+                    author=None, commit_message=None):
+        """Write rows straight into the catalog as DuckLake **inlined data** — no
+        Parquet, no DuckDB, no object store. Each row lands in
+        ``ducklake_inlined_data_<table_id>_<schema_version>`` in the native inlining
+        format (MVCC bookkeeping ``row_id`` / ``begin_snapshot`` / ``end_snapshot`` plus
+        the table's columns), and reads union it with the table's Parquet files. Ideal
+        for small / frequent arrivals (e.g. CDC/CT polling since a HWM); squish to
+        Parquet later with the native ``ducklake_flush_inlined_data``.
+
+        Scalar / simple-typed columns only (int, double, varchar, boolean, decimal,
+        date/time/timestamp). A nested column (LIST/STRUCT/MAP) raises — route those
+        through Parquet, where types are exact and portable. ``rows`` is an iterable of
+        ``{column_name: value}`` dicts.
+        """
+        rows = list(rows)
+        if not rows:
+            return {"inlined": 0, "snapshot_id": None}
+        with self.engine.begin() as conn:
+            self._load_state(conn)
+            table_id = self._find_table_id(conn, table_name, schema_name)
+            col = self._column
+            cols = conn.execute(
+                select(col.c.column_name, col.c.column_type)
+                .where(and_(col.c.table_id == table_id, col.c.end_snapshot.is_(None)))
+                .order_by(col.c.column_order)).fetchall()
+            for cname, ctype in cols:
+                if _is_nested_type(ctype):
+                    raise ValueError(
+                        f"inline_rows: column '{cname}' has nested type '{ctype}'; inline "
+                        f"only scalar/simple types — register such a table as Parquet")
+            sv = self._schema_version
+            inlined = f"ducklake_inlined_data_{table_id}_{sv}"
+
+            # The registry + per-table inlined table (the extension makes these on first
+            # inline; for a pure-OOB lake we create them, matching the native shape).
+            conn.execute(text(
+                "CREATE TABLE IF NOT EXISTS ducklake_inlined_data_tables "
+                "(table_id BIGINT, table_name VARCHAR, schema_version BIGINT)"))
+            coldefs = ", ".join(f"{cn} {_inline_storage_type(ct)}" for cn, ct in cols)
+            conn.execute(text(
+                f"CREATE TABLE IF NOT EXISTS {inlined} "
+                f"(row_id BIGINT, begin_snapshot BIGINT, end_snapshot BIGINT, {coldefs})"))
+            if not conn.execute(text("SELECT count(*) FROM ducklake_inlined_data_tables "
+                                     "WHERE table_name=:n"), {"n": inlined}).scalar():
+                conn.execute(text(
+                    "INSERT INTO ducklake_inlined_data_tables (table_id, table_name, schema_version) "
+                    "VALUES (:t,:n,:s)"), {"t": table_id, "n": inlined, "s": sv})
+
+            snapshot_id = self._alloc_snapshot_id()
+            ts = self._table_stats
+            ts_row = conn.execute(select(ts.c.record_count, ts.c.next_row_id, ts.c.file_size_bytes)
+                                  .where(ts.c.table_id == table_id)).fetchone()
+            cur_rc, cur_next, cur_size = ts_row if ts_row else (0, 0, 0)
+
+            conn.execute(self._snapshot.insert().values(
+                snapshot_id=snapshot_id, snapshot_time=snapshot_time or func.now(),
+                schema_version=sv, next_catalog_id=self._next_catalog_id,
+                next_file_id=self._next_file_id))
+
+            colnames = [cn for cn, _ in cols]
+            collist = ", ".join(["row_id", "begin_snapshot", "end_snapshot"] + colnames)
+            binds = ", ".join([":row_id", ":begin_snapshot", ":end_snapshot"]
+                              + [f":{c}" for c in colnames])
+            payload = []
+            for i, r in enumerate(rows):
+                row = {"row_id": cur_next + i, "begin_snapshot": snapshot_id, "end_snapshot": None}
+                for cn, ct in cols:
+                    row[cn] = _inline_value(ct, r.get(cn))
+                payload.append(row)
+            conn.execute(text(f"INSERT INTO {inlined} ({collist}) VALUES ({binds})"), payload)
+
+            n = len(rows)
+            new_ts = dict(record_count=cur_rc + n, next_row_id=cur_next + n, file_size_bytes=cur_size)
+            if ts_row:
+                conn.execute(ts.update().where(ts.c.table_id == table_id).values(**new_ts))
+            else:
+                conn.execute(ts.insert().values(table_id=table_id, **new_ts))
+
+            conn.execute(self._snapshot_changes.insert().values(
+                snapshot_id=snapshot_id, changes_made=f"inlined_insert:{table_id}",
+                author=author,
+                commit_message=commit_message or f"Inline {n} row(s) into {table_name}",
+                commit_extra_info=None))
+            recanonicalize(conn)
+        logger.debug("inlined {n} row(s) into {schema}.{table}",
+                     n=n, schema=schema_name, table=table_name)
+        return {"inlined": n, "snapshot_id": snapshot_id}
 
     def current_tables(self):
         """List all current (non-deleted) tables.

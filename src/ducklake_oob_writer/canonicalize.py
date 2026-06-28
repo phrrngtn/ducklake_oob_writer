@@ -32,7 +32,7 @@ from __future__ import annotations
 
 from loguru import logger
 from sqlalchemy import (BigInteger, Column, Connection, MetaData, Table, case,
-                        func, select, update)
+                        func, inspect, select, text, update)
 
 from ducklake_oob_writer.catalog import DUCKLAKE_METADATA
 
@@ -42,11 +42,15 @@ def _renumber(conn):
     (joins the caller's transaction)."""
     meta = DUCKLAKE_METADATA
     snap = meta.tables["ducklake_snapshot"]
-    dfile = meta.tables["ducklake_data_file"]
+    changes = meta.tables["ducklake_snapshot_changes"]
 
     # (1) canonical id per snapshot, in SQL: schema snapshots first (by id), then data
-    #     snapshots by transaction-time. is_data via a join to the data-file snapshots.
-    data_snaps = select(dfile.c.begin_snapshot.label("sid")).distinct().subquery()
+    #     snapshots by transaction-time. A "data" snapshot is one that inserted data —
+    #     a Parquet file OR inlined rows — per the change log (inlined inserts write no
+    #     data_file row, so we must read the log, not ducklake_data_file).
+    data_snaps = select(changes.c.snapshot_id.label("sid")).where(
+        changes.c.changes_made.like("inserted_into_table:%")
+        | changes.c.changes_made.like("inlined_insert:%")).distinct().subquery()
     ranked = select(
         snap.c.snapshot_id.label("old_id"),
         (func.row_number().over(order_by=[
@@ -81,6 +85,17 @@ def _renumber(conn):
                     conn.execute(update(t).where(col.in_(moved)).values(
                         {colname: select(violators.c.new_id)
                                   .where(violators.c.old_id == col).scalar_subquery()}))
+
+        # (3b) inlined data tables carry begin/end_snapshot too, but are dynamic (not in
+        #      our MetaData), so remap them the same way — else an out-of-order inlined
+        #      backfill would time-travel wrong after the renumber.
+        if inspect(conn).has_table("ducklake_inlined_data_tables"):
+            for (name,) in conn.execute(text("SELECT table_name FROM ducklake_inlined_data_tables")):
+                for colname in ("begin_snapshot", "end_snapshot"):
+                    conn.execute(text(
+                        f"UPDATE {name} SET {colname} = "
+                        f"(SELECT new_id FROM _oob_violators WHERE old_id = {colname}) "
+                        f"WHERE {colname} IN (SELECT old_id FROM _oob_violators)"))
 
         # (4) the two snapshot_id-PK tables — permutation via offset (collision-free):
         #     shift the moved ids past the max, then map them down off `violators`.
