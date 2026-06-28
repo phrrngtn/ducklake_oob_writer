@@ -35,6 +35,12 @@ from ducklake_oob_writer.incorporation import (
 from ducklake_oob_writer.parquet import content_hash, footer_and_size
 from ducklake_oob_writer.writer import DuckLakeWriter
 
+# loguru library convention: stay silent unless the consuming app opts in with
+#   from loguru import logger; logger.enable("ducklake_oob_writer")
+from loguru import logger as _logger
+
+_logger.disable("ducklake_oob_writer")
+
 __all__ = [
     "DUCKLAKE_METADATA",
     "DUCKLAKE_VERSION",

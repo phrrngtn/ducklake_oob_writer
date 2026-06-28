@@ -205,10 +205,13 @@ demands, keeping the writer a small, comprehensible core:
   lying stats silently corrupt query results / pruning. *Guards (when needed):* the
   Parquet actually reads and exists at the recorded path; declared columns present
   with compatible types; a partition/dimension column genuinely constant (`min==max`
-  — already enforced); **content-hash dedup** so the same artifact twice is a no-op
-  (idempotence); stats *derived from the file*, never trusted from a caller; a
+  — already enforced); stats *derived from the file*, never trusted from a caller; a
   *plausible* `transaction_time` (the "no later than N" bound reused as a
-  data-validation guard, **not** a performance watermark).
+  data-validation guard, **not** a performance watermark). (**Content-hash dedup** —
+  same `(table, rel_path, content_hash)` twice is a no-op — is now **built**:
+  `register_*` records a sha256 in `oob_incorporation` and `register_data_file`
+  short-circuits a re-incorporation. Path-aware so byte-identical hive partitions at
+  different paths stay distinct.)
 
 **Explicitly NOT built (lily-gilding for a regime we don't have):** the append-only
 event log, a watermark that would bound even the inversion check + recompute to a

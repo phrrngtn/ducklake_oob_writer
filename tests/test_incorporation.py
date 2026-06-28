@@ -14,7 +14,7 @@ import pytest
 
 pytest.importorskip("duckdb")
 import duckdb
-from sqlalchemy import create_engine, select
+from sqlalchemy import create_engine, func, select, text
 
 import ducklake_oob_writer as dl
 from ducklake_oob_writer.incorporation import INCORPORATION_LOG
@@ -74,3 +74,31 @@ def test_incorporation_log_and_lake_as_known_at(tmp_path):
     assert _markers(k1, data, at="2026-06-07") == {"B": 5}
     # after all three
     assert _markers(project("k2", seq=2), data) == {"A": 10, "B": 5, "C": 8}
+
+
+def test_reincorporating_same_file_is_a_noop(tmp_path):
+    data = os.path.join(str(tmp_path), "data")
+    cat = os.path.join(str(tmp_path), "cat.sqlite")
+    os.makedirs(os.path.join(data, "main", "facts"), exist_ok=True)
+
+    dw = duckdb.connect()
+    eng = create_engine(f"sqlite:///{cat}")
+    dl.create_catalog(eng)
+    w = dl.DuckLakeWriter(eng, dl.DUCKLAKE_METADATA)
+    w.init_catalog(data_path=data)
+    w.create_table("main", "facts", [("m", "varchar"), ("id", "int64")],
+                   snapshot_time=dt.datetime(2026, 6, 1))
+    f = os.path.join(data, "main", "facts", "A.parquet")
+    dw.execute(f"COPY (SELECT 'A' AS m, range AS id FROM range(0,10)) TO '{f}' (FORMAT PARQUET)")
+    first = w.register_parquet("facts", f, snapshot_time=dt.datetime(2026, 6, 10))
+    second = w.register_parquet("facts", f, snapshot_time=dt.datetime(2026, 6, 10))  # same bytes + path
+    dw.close()
+
+    assert first["deduped"] is False
+    assert second["deduped"] is True
+    assert second["data_file_id"] == first["data_file_id"]   # the existing file, not a new one
+    with eng.connect() as c:
+        assert c.execute(select(func.count()).select_from(INCORPORATION_LOG)).scalar() == 1
+        assert c.execute(text("SELECT count(*) FROM ducklake_data_file")).scalar() == 1
+    eng.dispose()
+    assert _markers(cat, data) == {"A": 10}                  # not doubled to 20

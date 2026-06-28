@@ -49,11 +49,12 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from uuid import uuid4
 
-from sqlalchemy import select, func, and_
+from loguru import logger
+from sqlalchemy import select, func, and_, text
 
 from ducklake_oob_writer.canonicalize import recanonicalize
 from ducklake_oob_writer.catalog import DUCKLAKE_VERSION
-from ducklake_oob_writer.incorporation import record_incorporation
+from ducklake_oob_writer.incorporation import create_incorporation_log, record_incorporation
 
 
 class DuckLakeWriter:
@@ -483,6 +484,28 @@ class DuckLakeWriter:
             self._load_state(conn)
 
             table_id = self._find_table_id(conn, table_name, schema_name)
+
+            # Content-addressed idempotence: if this exact file — same table, same
+            # relative path, same content hash — is already incorporated, do nothing
+            # and return its existing data_file_id. Path-aware on purpose: two hive
+            # partitions can have byte-identical files at different paths.
+            if content_hash is not None:
+                create_incorporation_log(conn)
+                existing = conn.execute(text(
+                    "SELECT df.data_file_id FROM ducklake_data_file df "
+                    "JOIN oob_incorporation i ON i.data_file_id = df.data_file_id "
+                    "WHERE df.table_id = :t AND df.path = :p AND i.content_hash = :h "
+                    "AND df.end_snapshot IS NULL"),
+                    {"t": table_id, "p": path, "h": content_hash}).scalar()
+                if existing is not None:
+                    logger.info(
+                        "skipping already-incorporated {schema_name}.{table_name}/{path} "
+                        "(content {digest}…)",
+                        schema_name=schema_name, table_name=table_name, path=path,
+                        digest=content_hash[:12])
+                    return {"data_file_id": existing, "snapshot_id": None,
+                            "row_id_start": None, "deduped": True}
+
             snapshot_id = self._alloc_snapshot_id()
             file_id = self._alloc_file_id()
 
@@ -643,7 +666,8 @@ class DuckLakeWriter:
             # callers never have to think about it (see canonicalize.py).
             recanonicalize(conn)
 
-        return {"data_file_id": file_id, "snapshot_id": snapshot_id, "row_id_start": row_id_start}
+        return {"data_file_id": file_id, "snapshot_id": snapshot_id,
+                "row_id_start": row_id_start, "deduped": False}
 
     def register_parquet(self, table_name, fs_path, *, rel_path=None,
                          snapshot_time=None, author=None, commit_message=None,
@@ -730,6 +754,9 @@ class DuckLakeWriter:
             snapshot_time=snapshot_time, author=author,
             commit_message=commit_message, schema_name=schema_name, column_stats=cstats,
             content_hash=chash, source_uri=source_uri)
+
+        if info.get("deduped"):
+            return info        # already incorporated at this path — mapping is already there
 
         # Attach a map_by_name mapping: real columns by name; hive columns flagged
         # is_partition so DuckLake reads them from the path, not the file.

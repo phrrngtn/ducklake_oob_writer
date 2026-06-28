@@ -30,6 +30,7 @@ remap alone and the dimension encoding is preserved by construction.
 """
 from __future__ import annotations
 
+from loguru import logger
 from sqlalchemy import (BigInteger, Column, Connection, MetaData, Table, case,
                         func, select, update)
 
@@ -66,6 +67,10 @@ def _renumber(conn):
         conn.execute(violators.insert().from_select(
             ["old_id", "new_id"],
             select(ranked.c.old_id, ranked.c.new_id).where(ranked.c.old_id != ranked.c.new_id)))
+        n = conn.execute(select(func.count()).select_from(violators)).scalar()
+        if not n:
+            return                       # already in transaction-time order — nothing to do
+        logger.info("recanonicalize: renumbering {n} snapshot(s) into transaction-time order", n=n)
         moved = select(violators.c.old_id)
 
         # (3) references (non-unique begin/end_snapshot) — set-based remap, any order.

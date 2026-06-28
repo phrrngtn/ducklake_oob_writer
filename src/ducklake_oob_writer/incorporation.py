@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import datetime as _dt
 
+from loguru import logger
 from sqlalchemy import (BigInteger, Column, DateTime, MetaData, Table, Text, func,
                         select, text)
 
@@ -65,6 +66,10 @@ def record_incorporation(conn, *, content_hash, source_uri, transaction_time,
         transaction_time=transaction_time,
         incorporation_time=incorporation_time or _dt.datetime.now(_dt.timezone.utc),
         schema_name=schema_name, table_name=table_name, data_file_id=data_file_id))
+    logger.debug(
+        "incorporated {schema_name}.{table_name} <- {digest}… as seq {seq}",
+        schema_name=schema_name, table_name=table_name,
+        digest=(content_hash or "")[:12], seq=seq)
     return seq
 
 
@@ -133,6 +138,11 @@ def lake_as_known_at(source_engine, target_engine, *, seq=None, incorporation_ti
             files.append({"table_id": tid, "path": path, "record_count": rc,
                           "file_size_bytes": fsz, "footer_size": foot,
                           "transaction_time": _parse_ts(st), "stats": stats or None, "mapping_id": mid})
+
+        logger.info(
+            "lake_as_known_at({cut}): projecting {n} file(s) over the shared Parquet",
+            cut=(f"seq<={seq}" if seq is not None else f"time<={incorporation_time}"),
+            n=len(included))
 
         mappings = {}
         for mid, mtid, mtype in src.execute(text(
