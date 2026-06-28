@@ -71,14 +71,20 @@ backfill), `AT (TIMESTAMP)` is wrong in both directions — a backfilled fact bo
 leaks into earlier as-of queries and disappears from later ones — because the
 backfill's high `snapshot_id` makes its cumulative state include later-dated data.
 
-**`recanonicalize(source_engine, target_engine)`** (implemented) fixes it: rebuild
-the catalog so `snapshot_id` order matches `snapshot_time` order — the *one*
-canonical arrangement. It is a pure, deterministic function of the data (sort by
-`(snapshot_time, path)`, replay), touches no Parquet (reuses the catalog's stats),
-and is a no-op on already-ordered input.
+**`recanonicalize(engine)`** (implemented) fixes it **in place**: it renumbers the
+snapshots so `snapshot_id` order matches `snapshot_time` order — the *one* canonical
+arrangement. It is *not* a replay; everything needed is already in the catalog, so the
+new consistent state is computed directly (rank the snapshots: schema first, then data
+by `snapshot_time`) and applied as a **set-based DML batch in one transaction**, via
+SQLAlchemy Core (dialect-portable, no per-dialect SQL). It touches only the *moved*
+snapshots and the references to them, is idempotent (a single inversion-count query
+and done when already ordered), and touches no Parquet. The native reader doesn't
+read `row_id_start` or the per-snapshot allocation counters (verified by probe), so
+the renumber is the snapshot-id remap alone; column/name mappings and partition specs
+carry no snapshot id and survive untouched.
 
-Because it rewrites every `snapshot_id`: **surrogates carry no meaning outside the
-database and are expected to change.** Clients time-travel by `TIMESTAMP` (stable),
+Because it rewrites every moved `snapshot_id`: **surrogates carry no meaning outside
+the database and are expected to change.** Clients time-travel by `TIMESTAMP` (stable),
 not by `VERSION` (a derived ordinal this operation recomputes). Querying by version
 is still allowed — just understood as volatile.
 
@@ -123,19 +129,13 @@ caveats:
 
 ## 3. How they compose (and where the seam is)
 
-The two concerns meet in the event log: each event is *self-describing* — it records
-its **encoding recipe** (relocate vs rewrite, the mapping, the stats) and its
-**times** — and `recanonicalize` is just a faithful replay in `transaction_time`
-order. Encoding is a property of an event; temporal order is the fold order; they
-don't interact.
-
-The two axes are now fully orthogonal in the build: `recanonicalize` replays **both**
-recipes faithfully — the **rewrite** path (reuse `file_column_stats`, re-run
-`register_data_file` + `set_partitioning`) *and* the **relocate/hive** path (recreate
-each file's `column_mapping` / `name_mapping` / `mapping_id`, re-pointed at the rebuilt
-tables' column ids). Canonicalizing a lake that contains `register_virtual` files
-preserves the path-virtualized columns — proven by a native-reader round-trip after a
-canonicalize (`test_canonicalize_mapping.py`).
+The two axes are **orthogonal by construction**. Dimension encoding lives in the
+data files and in `file_column_stats` / `column_mapping` / `name_mapping` / partition
+specs — *none* of which carry a snapshot id. Temporal order lives in `snapshot_id`.
+So `recanonicalize`, which only renumbers `snapshot_id` and the columns that reference
+it, **cannot touch the encoding** — the path-virtual and rewrite columns are preserved
+for free, no special handling. Proven by a native-reader round-trip after canonicalizing
+a lake of `register_virtual` files (`test_canonicalize_mapping.py`).
 
 ---
 
@@ -144,7 +144,7 @@ canonicalize (`test_canonicalize_mapping.py`).
 | piece | state |
 |---|---|
 | Rewrite-style dimensions (`set_partitioning` + `min==max` derivation) | **implemented** + tested |
-| `recanonicalize` (transaction-time order, replays rewrite **and** hive mappings) | **implemented** + tested |
+| `recanonicalize` (in-place set-based snapshot renumber, idempotent, SA-Core/dialect-portable) | **implemented** + tested |
 | Relocate-style `register_virtual` (hive `name_mapping`) | **implemented** + round-trip tested (materialize + prune from the path; no rewrite) |
 | Auto-trigger for canonicalization (fire on out-of-order arrival) | approach + mechanism done; only the automatic firing deferred |
 | Content-hash event log + `incorporation_time`/sequence + `lake_as_known_at` | designed |
@@ -180,14 +180,13 @@ many lakes* is an actual problem — not yet.
 ## Out-of-order handling — the decision (committed)
 
 **Decided, and the mechanism is built.** Out-of-order / backfilled arrivals are
-fixed by **synchronous full-replay `recanonicalize` + atomic swap** — explicitly
-chosen *over* the async machinery in the next section. `recanonicalize` is
-implemented and tested (including `register_virtual` mapping replay), and because
-it builds a fresh catalog and swaps it in, the database is never observably
-inconsistent. The **only** part not yet wired is firing it **automatically** on a
-detected out-of-order `transaction_time`; today you invoke `recanonicalize`
-explicitly after a backfill. That auto-trigger is the lone deferred temporal piece —
-the *trigger*, not the *approach*.
+fixed by a **synchronous, in-place, idempotent `recanonicalize`** — explicitly chosen
+*over* the async machinery in the next section. It is one transaction of set-based DML
+(SQLAlchemy Core, dialect-portable) that renumbers the moved snapshots; called after a
+backfill it does the right thing, and called when already ordered it's a cheap no-op.
+The **only** part not yet wired is having the write-back call it *itself* (so a
+backfilling `register_*` runs the check-and-fix as a deterministic part of its own
+flow); today you invoke `recanonicalize(engine)` explicitly after incorporating.
 
 ## Deferred by design — recorded, not built (avoid over-engineering)
 
@@ -208,8 +207,9 @@ demands, keeping the writer a small, comprehensible core:
   automation is deferred.
 
 **Explicitly NOT built (lily-gilding for a regime we don't have):** the append-only
-event log, watermark-gated *splice* canonicalization, and derived-catalog
-catch-up. At hours/days incorporation cadence over cheap metadata, the synchronous
-full-replay `recanonicalize` is both simpler and always-consistent — no inconsistency
-window. The guiding principle is to keep the OOB writer minimal and resist adding
+event log, a watermark that would bound even the inversion check + recompute to a
+recent window, and a derived-catalog catch-up. At hours/days incorporation cadence
+over cheap metadata, the synchronous in-place `recanonicalize` is both simpler and
+always-consistent — no inconsistency window, and it already writes only the moved
+slice. The guiding principle is to keep the OOB writer minimal and resist adding
 machinery before a real problem motivates it.
