@@ -45,7 +45,7 @@ This — together with the **path-vs-rewrite dimension encoding** for partition/
 |--------|-------------|
 | `init_catalog(data_path, version=DUCKLAKE_VERSION, author=None)` | One-time bootstrap: snapshot 0, `main` schema, metadata |
 | `create_table(schema_name, table_name, columns, snapshot_time=None, ...)` | Register a new table + columns (`columns` = list of `(name, ducklake_type)`) |
-| `register_data_file(table_name, path, record_count, file_size_bytes, footer_size, snapshot_time=None, column_stats=None, ...)` | Register a Parquet data file (`path` is **relative to the table directory**); pass `column_stats` to add query-pruning stats |
+| `register_data_file(table_name, path, record_count, file_size_bytes, footer_size, snapshot_time=None, column_stats=None, ...)` | Register a Parquet data file. A bare `path` is **relative to the table directory** under `DATA_PATH`; an **absolute path or URI** (`s3://…`, `gs://…`, `/abs/…`) is stored verbatim (`path_is_relative=False`) so one catalog can union files **scattered across backends** (the reader just needs a secret per endpoint). Pass `column_stats` to add query-pruning stats |
 | `register_parquet(table_name, fs_path, snapshot_time=None, ...)` | Convenience: read an on-disk Parquet file and register it, computing size/footer/record-count + per-column *pruning* stats via DuckDB |
 | `current_tables()` / `current_columns(table)` / `snapshots()` | Introspection |
 

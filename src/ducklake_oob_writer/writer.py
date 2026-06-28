@@ -57,6 +57,15 @@ from ducklake_oob_writer.catalog import DUCKLAKE_VERSION
 from ducklake_oob_writer.incorporation import create_incorporation_log, record_incorporation
 
 
+def _is_absolute_uri(path):
+    """A fully-qualified data-file location — a URI (``s3://…``, ``gs://…``,
+    ``file://…``) or an absolute filesystem path — stored verbatim with
+    ``path_is_relative=False`` so a single catalog can reference files scattered across
+    many backends. A bare relative path is resolved against the table directory under
+    ``DATA_PATH`` (``path_is_relative=True``)."""
+    return "://" in path or path.startswith("/")
+
+
 class DuckLakeWriter:
     """OOB writer for DuckLake metadata tables via SA expression API.
 
@@ -545,7 +554,7 @@ class DuckLakeWriter:
                 end_snapshot=None,
                 file_order=None,
                 path=path,
-                path_is_relative=True,
+                path_is_relative=not _is_absolute_uri(path),
                 file_format="parquet",
                 record_count=record_count,
                 file_size_bytes=file_size_bytes,
@@ -710,7 +719,8 @@ class DuckLakeWriter:
                 "SELECT count(*) FROM read_parquet(?)", [fs_path]).fetchone()[0]
             cstats = None
         return self.register_data_file(
-            table_name, path=rel_path or os.path.basename(fs_path),
+            table_name,
+            path=rel_path or (fs_path if _is_absolute_uri(fs_path) else os.path.basename(fs_path)),
             record_count=record_count, file_size_bytes=file_size_bytes,
             footer_size=footer_size, snapshot_time=snapshot_time, author=author,
             commit_message=commit_message, schema_name=schema_name, column_stats=cstats,
@@ -736,7 +746,7 @@ class DuckLakeWriter:
 
         from ducklake_oob_writer.parquet import column_stats, content_hash, footer_and_size
 
-        rel = rel_path or os.path.basename(fs_path)
+        rel = rel_path or (fs_path if _is_absolute_uri(fs_path) else os.path.basename(fs_path))
         hive = dict(seg.split("=", 1) for seg in os.path.dirname(rel).split("/")
                     if "=" in seg)
         file_size_bytes, footer_size = footer_and_size(fs_path)
