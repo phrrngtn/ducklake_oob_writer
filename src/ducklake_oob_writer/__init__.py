@@ -27,6 +27,7 @@ from ducklake_oob_writer.maintenance import (
     expire_snapshots,
     run_maintenance,
 )
+from ducklake_oob_writer.canonicalize import recanonicalize
 from ducklake_oob_writer.parquet import footer_and_size
 from ducklake_oob_writer.writer import DuckLakeWriter
 
@@ -36,6 +37,7 @@ __all__ = [
     "_build_metadata",
     "create_catalog",
     "DuckLakeWriter",
+    "recanonicalize",
     "footer_and_size",
     # maintenance (delegated to DuckLake's native engine; needs the `duckdb` extra)
     "attach_lake",
