@@ -377,6 +377,74 @@ class DuckLakeWriter:
             "column_ids": column_ids,
         }
 
+    def set_partitioning(self, table_name, columns, schema_name="main",
+                         snapshot_time=None, author=None, commit_message=None):
+        """Declare partition columns for an existing table (DuckLake-native).
+
+        Records a partition spec (``ducklake_partition_info`` +
+        ``ducklake_partition_column``). Files registered into this table afterwards
+        get the spec's ``partition_id`` and per-file partition values derived from
+        their own constant column (see :meth:`register_data_file`) — no Parquet is
+        rewritten; the partition column(s) must already exist in the table/files.
+
+        Args:
+            columns: partition keys — a list of column names (transform ``identity``)
+                or ``(column_name, transform)`` tuples.
+
+        Returns:
+            dict with partition_id, snapshot_id.
+        """
+        norm = [(c, "identity") if isinstance(c, str) else tuple(c) for c in columns]
+        with self.engine.begin() as conn:
+            self._load_state(conn)
+            table_id = self._find_table_id(conn, table_name, schema_name)
+            snapshot_id = self._alloc_snapshot_id()
+
+            col = self._column
+            name_to_id = {
+                n: i for i, n in conn.execute(
+                    select(col.c.column_id, col.c.column_name)
+                    .where(and_(col.c.table_id == table_id,
+                                col.c.end_snapshot.is_(None)))
+                ).fetchall()
+            }
+
+            # partition_id is its own id space (independent of catalog/file ids).
+            pinfo = self._t["ducklake_partition_info"]
+            max_pid = conn.execute(select(func.max(pinfo.c.partition_id))).scalar()
+            partition_id = (max_pid + 1) if max_pid is not None else 1
+
+            conn.execute(self._snapshot.insert().values(
+                snapshot_id=snapshot_id,
+                snapshot_time=snapshot_time or func.now(),
+                schema_version=self._schema_version,
+                next_catalog_id=self._next_catalog_id,
+                next_file_id=self._next_file_id,
+            ))
+            conn.execute(pinfo.insert().values(
+                partition_id=partition_id, table_id=table_id,
+                begin_snapshot=snapshot_id, end_snapshot=None))
+
+            pcol = self._t["ducklake_partition_column"]
+            rows = []
+            for idx, (cname, transform) in enumerate(norm):
+                cid = name_to_id.get(cname)
+                if cid is None:
+                    raise ValueError(
+                        f"set_partitioning: column '{cname}' not found in "
+                        f"'{schema_name}.{table_name}'")
+                rows.append(dict(
+                    partition_id=partition_id, table_id=table_id,
+                    partition_key_index=idx, column_id=cid, transform=transform))
+            conn.execute(pcol.insert(), rows)
+
+            conn.execute(self._snapshot_changes.insert().values(
+                snapshot_id=snapshot_id,
+                changes_made=f'set_partition_key:"{schema_name}"."{table_name}"',
+                author=author, commit_message=commit_message, commit_extra_info=None))
+
+        return {"partition_id": partition_id, "snapshot_id": snapshot_id}
+
     def register_data_file(self, table_name, path, record_count,
                            file_size_bytes, footer_size,
                            snapshot_time=None, author=None,
@@ -426,6 +494,15 @@ class DuckLakeWriter:
             cur_rc, cur_next, cur_size = ts_row if ts_row else (0, 0, 0)
             row_id_start = cur_next
 
+            # Active partition spec for this table (None when unpartitioned).
+            pinfo = self._t["ducklake_partition_info"]
+            pcol = self._t["ducklake_partition_column"]
+            spec_row = conn.execute(
+                select(pinfo.c.partition_id).where(and_(
+                    pinfo.c.table_id == table_id, pinfo.c.end_snapshot.is_(None)))
+            ).fetchone()
+            partition_id = spec_row[0] if spec_row else None
+
             # Snapshot
             conn.execute(self._snapshot.insert().values(
                 snapshot_id=snapshot_id,
@@ -449,7 +526,7 @@ class DuckLakeWriter:
                 file_size_bytes=file_size_bytes,
                 footer_size=footer_size,
                 row_id_start=row_id_start,
-                partition_id=None,
+                partition_id=partition_id,
                 encryption_key=None,
                 mapping_id=None,
                 partial_max=None,
@@ -493,6 +570,51 @@ class DuckLakeWriter:
                     ))
                 if rows:
                     conn.execute(self._file_column_stats.insert(), rows)
+
+            # Per-file partition values (when the table is partitioned). Derive each
+            # key's value from the file's own constant column — its min==max in the
+            # stats — so no parquet is rewritten; the partition column must be present.
+            if partition_id is not None:
+                col = self._column
+                id_to_name = {
+                    i: n for i, n in conn.execute(
+                        select(col.c.column_id, col.c.column_name)
+                        .where(and_(col.c.table_id == table_id,
+                                    col.c.end_snapshot.is_(None)))
+                    ).fetchall()
+                }
+                stats_by_name = {}
+                if column_stats:
+                    items = (list(column_stats.items())
+                             if isinstance(column_stats, dict) else list(column_stats))
+                    stats_by_name = {n: s for n, s in items}
+                keys = conn.execute(
+                    select(pcol.c.partition_key_index, pcol.c.column_id)
+                    .where(and_(pcol.c.partition_id == partition_id,
+                                pcol.c.table_id == table_id))
+                    .order_by(pcol.c.partition_key_index)
+                ).fetchall()
+                pv_rows = []
+                for key_index, cid in keys:
+                    cname = id_to_name.get(cid)
+                    st = stats_by_name.get(cname)
+                    if st is None:
+                        raise ValueError(
+                            f"register_data_file: '{table_name}' is partitioned by "
+                            f"'{cname}' but no column stats were supplied to derive its "
+                            f"value — pass column_stats (or use register_parquet)")
+                    mn, mx = st.get("min_value"), st.get("max_value")
+                    if mn != mx:
+                        raise ValueError(
+                            f"register_data_file: partition column '{cname}' is not "
+                            f"constant in '{path}' (min={mn!r}, max={mx!r}); a file must "
+                            f"belong to exactly one partition")
+                    pv_rows.append(dict(
+                        data_file_id=file_id, table_id=table_id,
+                        partition_key_index=key_index,
+                        partition_value=None if mn is None else str(mn)))
+                if pv_rows:
+                    conn.execute(self._t["ducklake_file_partition_value"].insert(), pv_rows)
 
             # Snapshot changes
             conn.execute(self._snapshot_changes.insert().values(
