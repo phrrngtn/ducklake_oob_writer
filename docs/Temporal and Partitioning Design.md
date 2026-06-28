@@ -156,7 +156,7 @@ a lake of `register_virtual` files (`test_canonicalize_mapping.py`).
 | `recanonicalize` (in-place set-based snapshot renumber, idempotent, SA-Core/dialect-portable) | **implemented** + tested |
 | Relocate-style `register_virtual` (hive `name_mapping`) | **implemented** + round-trip tested (materialize + prune from the path; no rewrite) |
 | Automatic canonicalization inside `register_data_file` (runs in the write transaction) | **implemented** + tested |
-| Content-hash event log + `incorporation_time`/sequence + `lake_as_known_at` | designed |
+| Content-hash incorporation log (`oob_incorporation`: both clocks + hash) + `lake_as_known_at` | **implemented** + tested |
 | Generalizing the fold over deletes / replacements / schema changes | open — needs per-event identity + ordering semantics |
 
 Deletes/replacements/schema-changes are also events; the clean append/incorporate

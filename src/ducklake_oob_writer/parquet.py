@@ -14,13 +14,33 @@ from __future__ import annotations
 import os
 import struct
 
-__all__ = ["footer_and_size", "column_stats"]
+__all__ = ["footer_and_size", "column_stats", "content_hash"]
 
 
 def _is_remote(path: str) -> bool:
     """True for object-store / remote URIs (s3://, gs://, …), False for local/file://."""
     i = path.find("://")
     return i != -1 and path[:i] != "file"
+
+
+def content_hash(path: str, *, algo: str = "sha256", storage_options: dict | None = None) -> str:
+    """Hex content digest of a file (default sha256), read in chunks — the content
+    address / dedup key for the incorporation log. Local paths use the stdlib;
+    object-store URIs need fsspec (the ``[s3]`` extra) and ``storage_options``."""
+    import hashlib
+
+    h = hashlib.new(algo)
+    if _is_remote(path):
+        import fsspec
+
+        with fsspec.open(path, "rb", **(storage_options or {})) as f:
+            for block in iter(lambda: f.read(1 << 20), b""):
+                h.update(block)
+    else:
+        with open(path, "rb") as f:
+            for block in iter(lambda: f.read(1 << 20), b""):
+                h.update(block)
+    return h.hexdigest()
 
 
 def _footer_from_tail(path: str, tail: bytes, size: int) -> tuple[int, int]:

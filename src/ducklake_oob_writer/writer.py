@@ -53,6 +53,7 @@ from sqlalchemy import select, func, and_
 
 from ducklake_oob_writer.canonicalize import recanonicalize
 from ducklake_oob_writer.catalog import DUCKLAKE_VERSION
+from ducklake_oob_writer.incorporation import record_incorporation
 
 
 class DuckLakeWriter:
@@ -450,7 +451,7 @@ class DuckLakeWriter:
                            file_size_bytes, footer_size,
                            snapshot_time=None, author=None,
                            commit_message=None, schema_name="main",
-                           column_stats=None):
+                           column_stats=None, content_hash=None, source_uri=None):
         """Register a Parquet data file for an existing table.
 
         Maintains ``ducklake_table_stats`` (record_count / next_row_id /
@@ -629,6 +630,15 @@ class DuckLakeWriter:
             # Keep snapshot_id order aligned with snapshot_time order, in THIS same
             # transaction. A backfilled (out-of-order) file would otherwise corrupt
             # AT(TIMESTAMP) time-travel; this renumbers it into place. Idempotent — a
+            # Record the incorporation (both clocks + content hash) in our ancillary
+            # log, in the same transaction, when a content hash is supplied.
+            if content_hash is not None:
+                record_incorporation(
+                    conn, content_hash=content_hash, source_uri=source_uri,
+                    transaction_time=(snapshot_time if snapshot_time is not None
+                                      else datetime.now(timezone.utc)),
+                    data_file_id=file_id, schema_name=schema_name, table_name=table_name)
+
             # single query and a no-op unless this file arrived out of order — so
             # callers never have to think about it (see canonicalize.py).
             recanonicalize(conn)
@@ -638,7 +648,7 @@ class DuckLakeWriter:
     def register_parquet(self, table_name, fs_path, *, rel_path=None,
                          snapshot_time=None, author=None, commit_message=None,
                          schema_name="main", with_column_stats=True,
-                         con=None, storage_options=None):
+                         con=None, storage_options=None, source_uri=None):
         """Register a Parquet file, computing footer size, file size, record count,
         and per-column (query-pruning) statistics from the file itself.
 
@@ -663,9 +673,10 @@ class DuckLakeWriter:
         import os
 
         from ducklake_oob_writer.parquet import column_stats as _column_stats
-        from ducklake_oob_writer.parquet import footer_and_size
+        from ducklake_oob_writer.parquet import content_hash, footer_and_size
 
         file_size_bytes, footer_size = footer_and_size(fs_path, storage_options=storage_options)
+        chash = content_hash(fs_path, storage_options=storage_options)
         if with_column_stats:
             record_count, cstats = _column_stats(fs_path, con=con)
         else:
@@ -678,10 +689,12 @@ class DuckLakeWriter:
             table_name, path=rel_path or os.path.basename(fs_path),
             record_count=record_count, file_size_bytes=file_size_bytes,
             footer_size=footer_size, snapshot_time=snapshot_time, author=author,
-            commit_message=commit_message, schema_name=schema_name, column_stats=cstats)
+            commit_message=commit_message, schema_name=schema_name, column_stats=cstats,
+            content_hash=chash, source_uri=source_uri)
 
     def register_virtual(self, table_name, fs_path, *, rel_path=None, snapshot_time=None,
-                         author=None, commit_message=None, schema_name="main", con=None):
+                         author=None, commit_message=None, schema_name="main", con=None,
+                         source_uri=None):
         """Register a hive-laid-out Parquet file whose partition columns live in the
         PATH, not the bytes (the "relocate" style — the file is left byte-identical).
 
@@ -697,12 +710,13 @@ class DuckLakeWriter:
         """
         import os
 
-        from ducklake_oob_writer.parquet import column_stats, footer_and_size
+        from ducklake_oob_writer.parquet import column_stats, content_hash, footer_and_size
 
         rel = rel_path or os.path.basename(fs_path)
         hive = dict(seg.split("=", 1) for seg in os.path.dirname(rel).split("/")
                     if "=" in seg)
         file_size_bytes, footer_size = footer_and_size(fs_path)
+        chash = content_hash(fs_path)
         record_count, cstats = column_stats(fs_path, con=con)
         cstats = dict(cstats) if isinstance(cstats, dict) else dict(cstats)
         for name, value in hive.items():               # virtual cols: min==max == path value
@@ -714,7 +728,8 @@ class DuckLakeWriter:
             table_name, path=rel, record_count=record_count,
             file_size_bytes=file_size_bytes, footer_size=footer_size,
             snapshot_time=snapshot_time, author=author,
-            commit_message=commit_message, schema_name=schema_name, column_stats=cstats)
+            commit_message=commit_message, schema_name=schema_name, column_stats=cstats,
+            content_hash=chash, source_uri=source_uri)
 
         # Attach a map_by_name mapping: real columns by name; hive columns flagged
         # is_partition so DuckLake reads them from the path, not the file.

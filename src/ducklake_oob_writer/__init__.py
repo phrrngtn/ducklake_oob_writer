@@ -28,7 +28,11 @@ from ducklake_oob_writer.maintenance import (
     run_maintenance,
 )
 from ducklake_oob_writer.canonicalize import recanonicalize
-from ducklake_oob_writer.parquet import footer_and_size
+from ducklake_oob_writer.incorporation import (
+    create_incorporation_log,
+    lake_as_known_at,
+)
+from ducklake_oob_writer.parquet import content_hash, footer_and_size
 from ducklake_oob_writer.writer import DuckLakeWriter
 
 __all__ = [
@@ -38,6 +42,9 @@ __all__ = [
     "create_catalog",
     "DuckLakeWriter",
     "recanonicalize",
+    "create_incorporation_log",
+    "lake_as_known_at",
+    "content_hash",
     "footer_and_size",
     # maintenance (delegated to DuckLake's native engine; needs the `duckdb` extra)
     "attach_lake",
