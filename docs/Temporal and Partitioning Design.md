@@ -129,15 +129,13 @@ its **encoding recipe** (relocate vs rewrite, the mapping, the stats) and its
 order. Encoding is a property of an event; temporal order is the fold order; they
 don't interact.
 
-One honest seam in the current build: `register_virtual` is implemented, but
-`recanonicalize` replays only the **rewrite** recipe faithfully (it reuses
-`file_column_stats` and re-runs `register_data_file` + `set_partitioning`) — it does
-**not yet** replay the **hive** `column_mapping` / `name_mapping` / `mapping_id`
-rows. So canonicalization composes cleanly with rewrite-style files today, but
-canonicalizing a lake that contains `register_virtual` files would currently drop
-their mappings (and break the path-virtualized columns). Closing that — teaching the
-fold to carry each file's mapping — is the remaining work to make the two axes fully
-orthogonal.
+The two axes are now fully orthogonal in the build: `recanonicalize` replays **both**
+recipes faithfully — the **rewrite** path (reuse `file_column_stats`, re-run
+`register_data_file` + `set_partitioning`) *and* the **relocate/hive** path (recreate
+each file's `column_mapping` / `name_mapping` / `mapping_id`, re-pointed at the rebuilt
+tables' column ids). Canonicalizing a lake that contains `register_virtual` files
+preserves the path-virtualized columns — proven by a native-reader round-trip after a
+canonicalize (`test_canonicalize_mapping.py`).
 
 ---
 
@@ -146,8 +144,9 @@ orthogonal.
 | piece | state |
 |---|---|
 | Rewrite-style dimensions (`set_partitioning` + `min==max` derivation) | **implemented** + tested |
-| `recanonicalize` (transaction-time order) | **implemented** + tested |
+| `recanonicalize` (transaction-time order, replays rewrite **and** hive mappings) | **implemented** + tested |
 | Relocate-style `register_virtual` (hive `name_mapping`) | **implemented** + round-trip tested (materialize + prune from the path; no rewrite) |
+| Auto-trigger for canonicalization (fire on out-of-order arrival) | approach + mechanism done; only the automatic firing deferred |
 | Content-hash event log + `incorporation_time`/sequence + `lake_as_known_at` | designed |
 | Generalizing the fold over deletes / replacements / schema changes | open — needs per-event identity + ordering semantics |
 
@@ -178,10 +177,22 @@ Would own discovery, ownership, and ad-hoc-lake lifecycle (TTL + GC), scraping e
 lake's `ducklake_*` (plain SQL) for a summary. Worth building only once *managing
 many lakes* is an actual problem — not yet.
 
+## Out-of-order handling — the decision (committed)
+
+**Decided, and the mechanism is built.** Out-of-order / backfilled arrivals are
+fixed by **synchronous full-replay `recanonicalize` + atomic swap** — explicitly
+chosen *over* the async machinery in the next section. `recanonicalize` is
+implemented and tested (including `register_virtual` mapping replay), and because
+it builds a fresh catalog and swaps it in, the database is never observably
+inconsistent. The **only** part not yet wired is firing it **automatically** on a
+detected out-of-order `transaction_time`; today you invoke `recanonicalize`
+explicitly after a backfill. That auto-trigger is the lone deferred temporal piece —
+the *trigger*, not the *approach*.
+
 ## Deferred by design — recorded, not built (avoid over-engineering)
 
-Captured so the *problem* is on record, but **not implemented** until the problem
-is demonstrated, and kept out so the writer stays a small, comprehensible core:
+Recorded so the *problem* is on record, but built no further than the problem
+demands, keeping the writer a small, comprehensible core:
 
 - **Incorporation validation — "don't record crap."** *Problem:* bad inputs or
   lying stats silently corrupt query results / pruning. *Guards (when needed):* the
@@ -191,12 +202,10 @@ is demonstrated, and kept out so the writer stays a small, comprehensible core:
   (idempotence); stats *derived from the file*, never trusted from a caller; a
   *plausible* `transaction_time` (the "no later than N" bound reused as a
   data-validation guard, **not** a performance watermark).
-- **Synchronous canonicalization on out-of-order arrival.** *Problem:* DuckLake's
-  surrogate-ordering redundancy turning valid data into wrong `AT (TIMESTAMP)`
-  answers. *When needed:* after incorporating a fact whose `transaction_time`
-  precedes an existing one, run `recanonicalize` and swap atomically so `snapshot_id`
-  order always matches `snapshot_time` order. The *mechanism* (`recanonicalize`) is
-  built; only the automatic *trigger* is deferred.
+- **The auto-trigger for canonicalization** (see the committed decision above) —
+  wiring `recanonicalize` to fire on its own when an arrival's `transaction_time`
+  precedes an existing snapshot. The approach and mechanism are settled; only the
+  automation is deferred.
 
 **Explicitly NOT built (lily-gilding for a regime we don't have):** the append-only
 event log, watermark-gated *splice* canonicalization, and derived-catalog

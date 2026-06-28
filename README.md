@@ -16,7 +16,15 @@ The result is a catalog that DuckDB's native `ducklake` extension reads as if it
 
 ### Why out-of-band?
 
-The headline reason is **carrying the source's transaction-time onto the DuckLake snapshot**. The native write path stamps every snapshot with the ETL process's wall-clock (`now()`); the OOB writer takes a `snapshot_time` argument so you can stamp it with the timestamp the *source system* assigned to the fact. That makes the lake **bitemporal**: `AS OF` time-travel reflects source reality, and late-arriving / backfilled data (e.g. a network-partitioned node catching up) lands at the correct point in history instead of being smeared onto catch-up time. See [`docs/DuckLake OOB Writer.md`](docs/DuckLake%20OOB%20Writer.md) for the full design and the bitemporal rationale.
+The headline reason is **carrying the source's transaction-time onto the DuckLake snapshot**. The native write path stamps every snapshot with the ETL process's wall-clock (`now()`); the OOB writer takes a `snapshot_time` argument so you can stamp it with the timestamp the *source system* assigned to the fact. That makes the lake **bitemporal**: `AS OF` time-travel can reflect source reality, and late-arriving / backfilled data (e.g. a network-partitioned node catching up) can land at the correct point in history rather than being smeared onto catch-up time — *provided the snapshots are kept in transaction-time order* (see [Out-of-order arrivals](#out-of-order-arrivals--time-travel) below). See [`docs/DuckLake OOB Writer.md`](docs/DuckLake%20OOB%20Writer.md) for the original design and the bitemporal rationale.
+
+## Out-of-order arrivals & time-travel
+
+Stamping `snapshot_time` with the source's transaction-time is necessary but **not sufficient** for correct `AS OF` time-travel. DuckLake orders a table's state by the surrogate `snapshot_id` (insertion order), *not* by `snapshot_time` — so a **late-arriving / backfilled** fact, written *after* later-dated data, lands at a higher `snapshot_id` and makes `AT (TIMESTAMP)` wrong in *both* directions: it leaks future-dated rows in, and drops the backfill out.
+
+The fix is **`recanonicalize(source_engine, target_engine)`** — it rebuilds the catalog so `snapshot_id` order matches `snapshot_time` order. It is a pure, deterministic, metadata-only fold (no Parquet re-read), a no-op on already-ordered input, and it preserves both rewrite- and hive-style dimension columns. Run it synchronously after a backfill and swap the rebuilt catalog in atomically, so the database is never observably inconsistent.
+
+This — together with the **path-vs-rewrite dimension encoding** for partition/pruning columns, and the surrogate-vs-natural-key reasoning behind the whole approach — is written up in full in **[`docs/Temporal and Partitioning Design.md`](docs/Temporal%20and%20Partitioning%20Design.md)**.
 
 ## API reference
 

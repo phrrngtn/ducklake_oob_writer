@@ -64,9 +64,9 @@ def _read_state(engine):
             partcols[tid] = [id2name[cid] for (cid,) in pc if cid in id2name]
 
         files = []
-        for fid, tid, path, rc, fsz, foot, st in c.execute(text(
+        for fid, tid, path, rc, fsz, foot, st, mid in c.execute(text(
                 "SELECT df.data_file_id, df.table_id, df.path, df.record_count, "
-                "df.file_size_bytes, df.footer_size, s.snapshot_time "
+                "df.file_size_bytes, df.footer_size, s.snapshot_time, df.mapping_id "
                 "FROM ducklake_data_file df "
                 "JOIN ducklake_snapshot s ON df.begin_snapshot = s.snapshot_id "
                 "WHERE df.end_snapshot IS NULL")).fetchall():
@@ -83,8 +83,23 @@ def _read_state(engine):
             files.append({"table_id": tid, "path": path, "record_count": rc,
                           "file_size_bytes": fsz, "footer_size": foot,
                           "transaction_time": _parse_ts(st),
-                          "column_stats": cstats or None})
-    return data_path, cols, partcols, files
+                          "column_stats": cstats or None, "mapping_id": mid})
+
+        # column/name mappings (register_virtual): keyed by source mapping_id, each
+        # name-mapping resolved to (source_name, target column NAME, is_partition) so
+        # it can be re-pointed at the rebuilt table's column ids.
+        mappings = {}
+        for mid, mtid, mtype in c.execute(text(
+                "SELECT mapping_id, table_id, type FROM ducklake_column_mapping")).fetchall():
+            nm = c.execute(text(
+                "SELECT nm.source_name, col.column_name, nm.is_partition "
+                "FROM ducklake_name_mapping nm "
+                "JOIN ducklake_column col ON nm.target_field_id = col.column_id "
+                "WHERE nm.mapping_id = :m AND col.end_snapshot IS NULL "
+                "ORDER BY nm.column_id"), {"m": mid}).fetchall()
+            mappings[mid] = {"table_id": mtid, "type": mtype,
+                             "cols": [(sn, cn, bool(isp)) for sn, cn, isp in nm]}
+    return data_path, cols, partcols, files, mappings
 
 
 def recanonicalize(source_engine, target_engine):
@@ -92,24 +107,53 @@ def recanonicalize(source_engine, target_engine):
     transaction-time order, so ``AT (TIMESTAMP)`` is correct regardless of the
     order files were originally registered. Deterministic — ties on
     ``snapshot_time`` are broken by ``path``. Returns the target ``MetaData``."""
-    data_path, cols, partcols, files = _read_state(source_engine)
+    data_path, cols, partcols, files, mappings = _read_state(source_engine)
 
     meta = create_catalog(target_engine)
     w = DuckLakeWriter(target_engine, meta)
     w.init_catalog(data_path=data_path)
 
+    src_to_tgt_table, field_of = {}, {}   # src table_id -> tgt; tgt table_id -> {col_name: col_id}
     for tid in sorted(cols):
         sname, tname, columns = cols[tid]
-        w.create_table(sname, tname, columns)
+        res = w.create_table(sname, tname, columns)
+        src_to_tgt_table[tid] = res["table_id"]
+        field_of[res["table_id"]] = dict(zip([n for n, _ in columns], res["column_ids"]))
         if partcols.get(tid):
             w.set_partitioning(tname, partcols[tid], schema_name=sname)
+
+    # Recreate register_virtual mappings, re-pointed at the rebuilt tables' column ids
+    # (deterministic new mapping ids; remember old -> new for the data files).
+    old_to_new_mid = {}
+    with target_engine.begin() as tc:
+        for new_mid, old_mid in enumerate(sorted(mappings)):
+            m = mappings[old_mid]
+            if m["table_id"] not in src_to_tgt_table:
+                continue
+            tgt_tid = src_to_tgt_table[m["table_id"]]
+            old_to_new_mid[old_mid] = new_mid
+            tc.execute(text("INSERT INTO ducklake_column_mapping(mapping_id, table_id, type) "
+                            "VALUES (:m, :t, :ty)"),
+                       {"m": new_mid, "t": tgt_tid, "ty": m["type"]})
+            for idx, (source_name, col_name, is_part) in enumerate(m["cols"]):
+                tc.execute(text(
+                    "INSERT INTO ducklake_name_mapping(mapping_id, column_id, source_name, "
+                    "target_field_id, parent_column, is_partition) "
+                    "VALUES (:m, :c, :s, :f, NULL, :p)"),
+                    {"m": new_mid, "c": idx, "s": source_name,
+                     "f": field_of[tgt_tid][col_name], "p": is_part})
 
     name_of = {tid: cols[tid] for tid in cols}
     for f in sorted(files, key=lambda f: (f["transaction_time"], f["path"])):
         sname, tname, _ = name_of[f["table_id"]]
-        w.register_data_file(
+        info = w.register_data_file(
             tname, path=f["path"], record_count=f["record_count"],
             file_size_bytes=f["file_size_bytes"], footer_size=f["footer_size"],
             schema_name=sname, column_stats=f["column_stats"],
             snapshot_time=f["transaction_time"])
+        if f.get("mapping_id") is not None and f["mapping_id"] in old_to_new_mid:
+            with target_engine.begin() as tc:
+                tc.execute(text("UPDATE ducklake_data_file SET mapping_id = :m "
+                                "WHERE data_file_id = :d"),
+                           {"m": old_to_new_mid[f["mapping_id"]], "d": info["data_file_id"]})
     return meta
