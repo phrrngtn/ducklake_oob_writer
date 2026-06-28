@@ -129,12 +129,15 @@ its **encoding recipe** (relocate vs rewrite, the mapping, the stats) and its
 order. Encoding is a property of an event; temporal order is the fold order; they
 don't interact.
 
-One honest seam in the current build: `recanonicalize` replays the **rewrite**
-recipe faithfully (it reuses `file_column_stats` and re-runs `register_data_file` +
-`set_partitioning`), but does **not yet** replay the **hive** `name_mapping` /
-`is_partition` rows. So today, canonicalization composes cleanly with rewrite-style
-files; making it equally faithful for relocate-style files is the work that lands
-alongside `register_virtual`.
+One honest seam in the current build: `register_virtual` is implemented, but
+`recanonicalize` replays only the **rewrite** recipe faithfully (it reuses
+`file_column_stats` and re-runs `register_data_file` + `set_partitioning`) — it does
+**not yet** replay the **hive** `column_mapping` / `name_mapping` / `mapping_id`
+rows. So canonicalization composes cleanly with rewrite-style files today, but
+canonicalizing a lake that contains `register_virtual` files would currently drop
+their mappings (and break the path-virtualized columns). Closing that — teaching the
+fold to carry each file's mapping — is the remaining work to make the two axes fully
+orthogonal.
 
 ---
 
@@ -144,7 +147,7 @@ alongside `register_virtual`.
 |---|---|
 | Rewrite-style dimensions (`set_partitioning` + `min==max` derivation) | **implemented** + tested |
 | `recanonicalize` (transaction-time order) | **implemented** + tested |
-| Relocate-style `register_virtual` (hive `name_mapping`) | designed; recipe verified via `add_data_files`; not yet a writer method |
+| Relocate-style `register_virtual` (hive `name_mapping`) | **implemented** + round-trip tested (materialize + prune from the path; no rewrite) |
 | Content-hash event log + `incorporation_time`/sequence + `lake_as_known_at` | designed |
 | Generalizing the fold over deletes / replacements / schema changes | open — needs per-event identity + ordering semantics |
 

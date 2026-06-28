@@ -672,6 +672,69 @@ class DuckLakeWriter:
             footer_size=footer_size, snapshot_time=snapshot_time, author=author,
             commit_message=commit_message, schema_name=schema_name, column_stats=cstats)
 
+    def register_virtual(self, table_name, fs_path, *, rel_path=None, snapshot_time=None,
+                         author=None, commit_message=None, schema_name="main", con=None):
+        """Register a hive-laid-out Parquet file whose partition columns live in the
+        PATH, not the bytes (the "relocate" style — the file is left byte-identical).
+
+        ``rel_path`` (relative to the table directory; default the basename) must be
+        hive-encoded — e.g. ``country=US/part-0.parquet``. The file's own columns are
+        mapped by name; each ``key=value`` segment becomes a virtual column that the
+        native reader materializes *from the path* and prunes on (via min==max stats).
+        The virtual columns must already exist in the table; columns that aren't
+        virtual must be physically present in the file. No Parquet is rewritten.
+
+        Requires the ``duckdb`` package (reads the real columns' stats); pass ``con``
+        for an object-store file (httpfs + secret already set up).
+        """
+        import os
+
+        from ducklake_oob_writer.parquet import column_stats, footer_and_size
+
+        rel = rel_path or os.path.basename(fs_path)
+        hive = dict(seg.split("=", 1) for seg in os.path.dirname(rel).split("/")
+                    if "=" in seg)
+        file_size_bytes, footer_size = footer_and_size(fs_path)
+        record_count, cstats = column_stats(fs_path, con=con)
+        cstats = dict(cstats) if isinstance(cstats, dict) else dict(cstats)
+        for name, value in hive.items():               # virtual cols: min==max == path value
+            cstats[name] = {"min_value": value, "max_value": value,
+                            "value_count": record_count, "null_count": 0,
+                            "column_size_bytes": 0, "contains_nan": False}
+
+        info = self.register_data_file(
+            table_name, path=rel, record_count=record_count,
+            file_size_bytes=file_size_bytes, footer_size=footer_size,
+            snapshot_time=snapshot_time, author=author,
+            commit_message=commit_message, schema_name=schema_name, column_stats=cstats)
+
+        # Attach a map_by_name mapping: real columns by name; hive columns flagged
+        # is_partition so DuckLake reads them from the path, not the file.
+        with self.engine.begin() as conn:
+            table_id = self._find_table_id(conn, table_name, schema_name)
+            col = self._column
+            name_to_id = {n: i for i, n in conn.execute(
+                select(col.c.column_id, col.c.column_name)
+                .where(and_(col.c.table_id == table_id, col.c.end_snapshot.is_(None)))
+                .order_by(col.c.column_order)).fetchall()}
+            cmap = self._t["ducklake_column_mapping"]
+            nmap = self._t["ducklake_name_mapping"]
+            max_mid = conn.execute(select(func.max(cmap.c.mapping_id))).scalar()
+            mapping_id = (max_mid + 1) if max_mid is not None else 0
+            conn.execute(cmap.insert().values(
+                mapping_id=mapping_id, table_id=table_id, type="map_by_name"))
+            rows, idx = [], 0
+            for name in [n for n in name_to_id if n not in hive] + list(hive):
+                rows.append(dict(mapping_id=mapping_id, column_id=idx, source_name=name,
+                                 target_field_id=name_to_id[name], parent_column=None,
+                                 is_partition=name in hive))
+                idx += 1
+            conn.execute(nmap.insert(), rows)
+            conn.execute(self._data_file.update()
+                         .where(self._data_file.c.data_file_id == info["data_file_id"])
+                         .values(mapping_id=mapping_id))
+        return {**info, "mapping_id": mapping_id, "virtual": hive}
+
     def current_tables(self):
         """List all current (non-deleted) tables.
 
