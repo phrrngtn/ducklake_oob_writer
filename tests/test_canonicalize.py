@@ -48,21 +48,15 @@ def _build(catalog_path, data, commit_order):
     eng.dispose()
 
 
-def test_out_of_order_breaks_then_recanonicalize_fixes(tmp_path):
+def test_out_of_order_arrival_is_auto_canonicalized(tmp_path):
     data = os.path.join(str(tmp_path), "data")
     cat = os.path.join(str(tmp_path), "cat.sqlite")
-    # backfill: commit the later-dated file first, the older-dated file second
+    # Backfill: commit the later-dated file first, the older-dated file second.
+    # register_data_file renumbers in the SAME transaction, so a broken state is
+    # never observable — no explicit recanonicalize call, no "assert broken" phase.
     _build(cat, data, ["june10", "june05"])
 
-    # broken: AT 06-07 leaks the future june10; AT 06-12 drops the june05 backfill
-    assert _markers_at(cat, data, "2026-06-07") == ["june05", "june10"]
-    assert _markers_at(cat, data, "2026-06-12") == ["june10"]
-
-    eng = create_engine(f"sqlite:///{cat}")
-    dl.recanonicalize(eng)            # in place
-    eng.dispose()
-
-    # fixed: as-of June 7 sees only the June 5 fact; as-of June 12 sees both
+    # as-of June 7 sees only the June 5 fact; as-of June 12 sees both
     assert _markers_at(cat, data, "2026-06-07") == ["june05"]
     assert _markers_at(cat, data, "2026-06-12") == ["june05", "june10"]
 

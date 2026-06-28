@@ -43,8 +43,7 @@ def test_recanonicalize_preserves_virtual_mappings(tmp_path):
     # registered OUT of source-time order (returns is a backfill) AND path-virtual
     w.register_virtual("events", rels[0][0], rel_path=rels[0][1], snapshot_time=dt.datetime(2026, 6, 10))
     w.register_virtual("events", rels[1][0], rel_path=rels[1][1], snapshot_time=dt.datetime(2026, 6, 5))
-    dl.recanonicalize(eng)            # in place
-    eng.dispose()
+    eng.dispose()                     # register_data_file already canonicalized in-transaction
 
     with dl.attach_lake(f"sqlite:{cat}", data) as c:
         # the path-virtual column still materializes + prunes after canonicalization

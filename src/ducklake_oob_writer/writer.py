@@ -51,6 +51,7 @@ from uuid import uuid4
 
 from sqlalchemy import select, func, and_
 
+from ducklake_oob_writer.canonicalize import recanonicalize
 from ducklake_oob_writer.catalog import DUCKLAKE_VERSION
 
 
@@ -624,6 +625,13 @@ class DuckLakeWriter:
                 commit_message=commit_message or f"Register data file for {table_name}",
                 commit_extra_info=None,
             ))
+
+            # Keep snapshot_id order aligned with snapshot_time order, in THIS same
+            # transaction. A backfilled (out-of-order) file would otherwise corrupt
+            # AT(TIMESTAMP) time-travel; this renumbers it into place. Idempotent — a
+            # single query and a no-op unless this file arrived out of order — so
+            # callers never have to think about it (see canonicalize.py).
+            recanonicalize(conn)
 
         return {"data_file_id": file_id, "snapshot_id": snapshot_id, "row_id_start": row_id_start}
 

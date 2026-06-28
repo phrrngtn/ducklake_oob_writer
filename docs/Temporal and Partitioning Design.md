@@ -71,17 +71,26 @@ backfill), `AT (TIMESTAMP)` is wrong in both directions — a backfilled fact bo
 leaks into earlier as-of queries and disappears from later ones — because the
 backfill's high `snapshot_id` makes its cumulative state include later-dated data.
 
-**`recanonicalize(engine)`** (implemented) fixes it **in place**: it renumbers the
-snapshots so `snapshot_id` order matches `snapshot_time` order — the *one* canonical
-arrangement. It is *not* a replay; everything needed is already in the catalog, so the
-new consistent state is computed directly (rank the snapshots: schema first, then data
-by `snapshot_time`) and applied as a **set-based DML batch in one transaction**, via
-SQLAlchemy Core (dialect-portable, no per-dialect SQL). It touches only the *moved*
-snapshots and the references to them, is idempotent (a single inversion-count query
-and done when already ordered), and touches no Parquet. The native reader doesn't
-read `row_id_start` or the per-snapshot allocation counters (verified by probe), so
-the renumber is the snapshot-id remap alone; column/name mappings and partition specs
-carry no snapshot id and survive untouched.
+This is fixed **automatically, in the same transaction**: `register_data_file`
+renumbers the snapshots so `snapshot_id` order matches `snapshot_time` order, so
+simply adding files keeps time-travel safe — the caller invokes nothing. (The
+standalone `recanonicalize(engine)` is also exported for manual use.)
+
+It is *not* a replay — everything needed is already in the catalog. The shape is
+**generate the work, then do it**: a SQL `ROW_NUMBER()` ranks the snapshots (schema
+first, then data by `snapshot_time`); a transient `violators` table is materialised
+with just the snapshots whose id changes; the non-unique `begin/end_snapshot`
+**references** are remapped with set-based `UPDATE`s (any order — DuckLake's catalog
+declares no foreign keys, so there's no dependency graph); and the two tables whose
+*primary key* is `snapshot_id` are renumbered with an offset move off the same
+`violators` table (shift the moved ids past the max, then map them down — permuting a
+unique key with no transient collision). All SQLAlchemy Core, dialect-portable, one
+transaction. **Idempotency falls out of the shape**: when the catalog is already
+ordered the `violators` set is empty and every statement touches zero rows — no guard,
+no `EXISTS`. It touches no Parquet; the native reader doesn't read `row_id_start` or
+the per-snapshot allocation counters (verified by probe), so the renumber is the
+snapshot-id remap alone; column/name mappings and partition specs carry no snapshot id
+and survive untouched.
 
 Because it rewrites every moved `snapshot_id`: **surrogates carry no meaning outside
 the database and are expected to change.** Clients time-travel by `TIMESTAMP` (stable),
@@ -146,7 +155,7 @@ a lake of `register_virtual` files (`test_canonicalize_mapping.py`).
 | Rewrite-style dimensions (`set_partitioning` + `min==max` derivation) | **implemented** + tested |
 | `recanonicalize` (in-place set-based snapshot renumber, idempotent, SA-Core/dialect-portable) | **implemented** + tested |
 | Relocate-style `register_virtual` (hive `name_mapping`) | **implemented** + round-trip tested (materialize + prune from the path; no rewrite) |
-| Auto-trigger for canonicalization (fire on out-of-order arrival) | approach + mechanism done; only the automatic firing deferred |
+| Automatic canonicalization inside `register_data_file` (runs in the write transaction) | **implemented** + tested |
 | Content-hash event log + `incorporation_time`/sequence + `lake_as_known_at` | designed |
 | Generalizing the fold over deletes / replacements / schema changes | open — needs per-event identity + ordering semantics |
 
@@ -177,16 +186,15 @@ Would own discovery, ownership, and ad-hoc-lake lifecycle (TTL + GC), scraping e
 lake's `ducklake_*` (plain SQL) for a summary. Worth building only once *managing
 many lakes* is an actual problem — not yet.
 
-## Out-of-order handling — the decision (committed)
+## Out-of-order handling — the decision (committed, built, automatic)
 
-**Decided, and the mechanism is built.** Out-of-order / backfilled arrivals are
-fixed by a **synchronous, in-place, idempotent `recanonicalize`** — explicitly chosen
-*over* the async machinery in the next section. It is one transaction of set-based DML
-(SQLAlchemy Core, dialect-portable) that renumbers the moved snapshots; called after a
-backfill it does the right thing, and called when already ordered it's a cheap no-op.
-The **only** part not yet wired is having the write-back call it *itself* (so a
-backfilling `register_*` runs the check-and-fix as a deterministic part of its own
-flow); today you invoke `recanonicalize(engine)` explicitly after incorporating.
+Out-of-order / backfilled arrivals are fixed by a **synchronous, in-place, idempotent**
+renumber — chosen *over* the async machinery in the next section — and it runs
+**automatically inside `register_data_file`, in the write transaction**, so the caller
+invokes nothing and a broken state is never observable. It is one transaction of
+set-based SQLAlchemy-Core DML (dialect-portable) that materialises the out-of-order
+snapshots and renumbers them; when the arrival was in order the work-set is empty and
+it's a no-op. (`recanonicalize(engine)` stays exported for manual/standalone use.)
 
 ## Deferred by design — recorded, not built (avoid over-engineering)
 
@@ -201,10 +209,6 @@ demands, keeping the writer a small, comprehensible core:
   (idempotence); stats *derived from the file*, never trusted from a caller; a
   *plausible* `transaction_time` (the "no later than N" bound reused as a
   data-validation guard, **not** a performance watermark).
-- **The auto-trigger for canonicalization** (see the committed decision above) —
-  wiring `recanonicalize` to fire on its own when an arrival's `transaction_time`
-  precedes an existing snapshot. The approach and mechanism are settled; only the
-  automation is deferred.
 
 **Explicitly NOT built (lily-gilding for a regime we don't have):** the append-only
 event log, a watermark that would bound even the inversion check + recompute to a
