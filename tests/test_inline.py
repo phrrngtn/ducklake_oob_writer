@@ -70,6 +70,56 @@ def test_inline_rows_rejects_nested_columns(tmp_path):
     eng.dispose()
 
 
+def test_inline_format_is_byte_identical_to_native_duckdb(tmp_path):
+    """Mimic-not-invent: OOB inlined data must match what DuckDB itself writes — same
+    inlined column types, same stored representation (read raw via stdlib sqlite3)."""
+    import sqlite3
+
+    cols = [("id", "int64"), ("m", "varchar"), ("amt", "decimal(10,2)"), ("ts", "timestamp")]
+
+    # (A) native DuckDB inlining
+    cat_a, data_a = os.path.join(str(tmp_path), "a.sqlite"), os.path.join(str(tmp_path), "da")
+    d = duckdb.connect()
+    d.execute("INSTALL ducklake; LOAD ducklake; INSTALL sqlite; LOAD sqlite")
+    d.execute(f"ATTACH 'ducklake:sqlite:{cat_a}' AS lake "
+              f"(DATA_PATH '{data_a}/', DATA_INLINING_ROW_LIMIT 100)")
+    d.execute("CREATE TABLE lake.main.t (id BIGINT, m VARCHAR, amt DECIMAL(10,2), ts TIMESTAMP)")
+    d.execute("INSERT INTO lake.main.t VALUES (1,'a',19.95,TIMESTAMP '2026-06-05 12:00:00'), "
+              "(2,'b',9.99,TIMESTAMP '2026-06-06 12:00:00')")
+    d.execute("DETACH lake")
+    d.close()
+
+    # (B) OOB inlining of the same rows
+    cat_b, data_b = os.path.join(str(tmp_path), "b.sqlite"), os.path.join(str(tmp_path), "db")
+    eng = create_engine(f"sqlite:///{cat_b}")
+    dl.create_catalog(eng)
+    w = dl.DuckLakeWriter(eng, dl.DUCKLAKE_METADATA)
+    w.init_catalog(data_path=data_b)
+    w.create_table("main", "t", cols)
+    w.inline_rows("t", [
+        {"id": 1, "m": "a", "amt": decimal.Decimal("19.95"), "ts": dt.datetime(2026, 6, 5, 12)},
+        {"id": 2, "m": "b", "amt": decimal.Decimal("9.99"), "ts": dt.datetime(2026, 6, 6, 12)},
+    ])
+    eng.dispose()
+
+    def inlined(path):
+        cx = sqlite3.connect(path)
+        name = cx.execute("SELECT table_name FROM ducklake_inlined_data_tables").fetchone()[0]
+        types = [(r[1], r[2]) for r in cx.execute(f"PRAGMA table_info({name})")]
+        vals = cx.execute(f"SELECT row_id, id, m, amt, ts FROM {name} ORDER BY row_id").fetchall()
+        cx.close()
+        return name, types, vals
+
+    name_a, types_a, vals_a = inlined(cat_a)
+    name_b, types_b, vals_b = inlined(cat_b)
+    # The format mimics DuckDB byte-for-byte: identical inlined column types AND stored
+    # representation. (The table_id in the name is a surrogate — OOB and DuckDB allocate
+    # it independently — and the reader resolves it via ducklake_inlined_data_tables.)
+    assert types_b == types_a, f"inlined column types diverge: OOB={types_b} native={types_a}"
+    assert vals_b == vals_a, f"stored representation diverges: OOB={vals_b} native={vals_a}"
+    assert name_b.startswith("ducklake_inlined_data_") and name_a.startswith("ducklake_inlined_data_")
+
+
 def test_out_of_order_inline_backfill_self_canonicalizes(tmp_path):
     data, cat, eng, w = _mk(tmp_path, [("id", "int64"), ("m", "varchar")])
     # commit the later-dated batch first, the older-dated one second (a CDC backfill)
