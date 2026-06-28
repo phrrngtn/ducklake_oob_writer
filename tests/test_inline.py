@@ -120,6 +120,29 @@ def test_inline_format_is_byte_identical_to_native_duckdb(tmp_path):
     assert name_b.startswith("ducklake_inlined_data_") and name_a.startswith("ducklake_inlined_data_")
 
 
+def test_mixed_seed_file_and_inline_stream(tmp_path):
+    """The snapshot+stream CDC shape: a Parquet seed (bulk current state) + inline rows
+    (subsequent changes) in ONE table — reads union both, time-travel spans both."""
+    data, cat, eng, w = _mk(tmp_path, [("id", "int64"), ("m", "varchar")])
+    os.makedirs(os.path.join(data, "main", "events"), exist_ok=True)
+    seed = os.path.join(data, "main", "events", "seed.parquet")
+    duckdb.connect().execute(
+        f"COPY (SELECT * FROM (VALUES (1,'seed_a'),(2,'seed_b')) t(id,m)) "
+        f"TO '{seed}' (FORMAT PARQUET)")
+    # seed = bulk state as of June 1 (a file); stream = a CDC change as of June 5 (inline)
+    w.register_parquet("events", seed, rel_path="seed.parquet", snapshot_time=dt.datetime(2026, 6, 1))
+    w.inline_rows("events", [{"id": 3, "m": "change_c"}], snapshot_time=dt.datetime(2026, 6, 5))
+    eng.dispose()
+
+    with dl.attach_lake(f"sqlite:{cat}", data) as c:
+        assert c.execute("SELECT count(*) FROM lake.events").fetchone()[0] == 3   # file ∪ inline
+        # time-travel spans the two methods: June 3 sees only the seed, June 6 sees both
+        assert c.execute("SELECT count(*) FROM lake.events "
+                         "AT (TIMESTAMP => TIMESTAMP '2026-06-03')").fetchone()[0] == 2
+        assert c.execute("SELECT id FROM lake.events "
+                         "AT (TIMESTAMP => TIMESTAMP '2026-06-06') ORDER BY id").fetchall() == [(1,), (2,), (3,)]
+
+
 def test_out_of_order_inline_backfill_self_canonicalizes(tmp_path):
     data, cat, eng, w = _mk(tmp_path, [("id", "int64"), ("m", "varchar")])
     # commit the later-dated batch first, the older-dated one second (a CDC backfill)
