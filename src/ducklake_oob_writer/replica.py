@@ -21,7 +21,7 @@ from uuid import uuid4
 
 from loguru import logger
 from sqlalchemy import (BigInteger, Column, MetaData, Table, Text, and_, delete as _delete,
-                        func, insert as _insert, select, text)
+                        func, insert as _insert, select)
 
 from ducklake_oob_writer import inlined
 from ducklake_oob_writer.canonicalize import recanonicalize
@@ -58,15 +58,15 @@ class Replica:
                 select(col.c.column_name, col.c.column_type)
                 .where(and_(col.c.table_id == tid, col.c.end_snapshot.is_(None)))
                 .order_by(col.c.column_order)).fetchall()
-            self._data_path = conn.execute(text(
-                "SELECT value FROM ducklake_metadata WHERE key='data_path'")).scalar()
+            self._data_path = writer._data_path(conn)
         self._names = [c[0] for c in self._cols]
         self._scope = and_(ROWMAP.c.schema_name == schema_name, ROWMAP.c.table_name == table_name)
 
     def _rel_path(self, data_file_id):
+        df = self.w._data_file
         with self.w.engine.connect() as conn:
-            return conn.execute(text("SELECT path FROM ducklake_data_file WHERE data_file_id = :d"),
-                                {"d": data_file_id}).scalar()
+            return conn.execute(select(df.c.path)
+                                .where(df.c.data_file_id == data_file_id)).scalar()
 
     def apply(self, upserts=(), deletes=(), *, snapshot_time=None):
         """Apply one poll's net changes. ``upserts``: full current rows (dicts incl. the key

@@ -50,12 +50,16 @@ from datetime import datetime, timezone
 from uuid import uuid4
 
 from loguru import logger
-from sqlalchemy import select, func, and_, text
+from sqlalchemy import select, func, and_
 
 from ducklake_oob_writer import inlined
 from ducklake_oob_writer.canonicalize import recanonicalize
 from ducklake_oob_writer.catalog import DUCKLAKE_VERSION
-from ducklake_oob_writer.incorporation import create_incorporation_log, record_incorporation
+from ducklake_oob_writer.incorporation import (
+    INCORPORATION_LOG,
+    create_incorporation_log,
+    record_incorporation,
+)
 
 
 def _is_absolute_uri(path):
@@ -281,6 +285,11 @@ class DuckLakeWriter:
             raise ValueError(f"Table '{schema_name}.{table_name}' not found")
         return row[0]
 
+    def _data_path(self, conn):
+        """The catalog's DATA_PATH (the data-file root) from ducklake_metadata."""
+        m = self._t["ducklake_metadata"]
+        return conn.execute(select(m.c.value).where(m.c.key == "data_path")).scalar()
+
     def create_table(self, schema_name, table_name, columns,
                      snapshot_time=None, author=None, commit_message=None,
                      commit_extra_info=None):
@@ -501,12 +510,13 @@ class DuckLakeWriter:
             # partitions can have byte-identical files at different paths.
             if content_hash is not None:
                 create_incorporation_log(conn)
-                existing = conn.execute(text(
-                    "SELECT df.data_file_id FROM ducklake_data_file df "
-                    "JOIN oob_incorporation i ON i.data_file_id = df.data_file_id "
-                    "WHERE df.table_id = :t AND df.path = :p AND i.content_hash = :h "
-                    "AND df.end_snapshot IS NULL"),
-                    {"t": table_id, "p": path, "h": content_hash}).scalar()
+                df, ilog = self._data_file, INCORPORATION_LOG
+                existing = conn.execute(
+                    select(df.c.data_file_id)
+                    .select_from(df.join(ilog, ilog.c.data_file_id == df.c.data_file_id))
+                    .where(and_(df.c.table_id == table_id, df.c.path == path,
+                                ilog.c.content_hash == content_hash,
+                                df.c.end_snapshot.is_(None)))).scalar()
                 if existing is not None:
                     logger.info(
                         "skipping already-incorporated {schema_name}.{table_name}/{path} "
@@ -926,8 +936,7 @@ class DuckLakeWriter:
                     f"so they must arrive in transaction-time order (tailing CT/CDC is "
                     f"monotonic, so this normally Just Works).")
 
-            data_path = conn.execute(text(
-                "SELECT value FROM ducklake_metadata WHERE key='data_path'")).scalar()
+            data_path = self._data_path(conn)
             tdir = os.path.join(data_path, schema_name, table_name)
             del_rel = f"{os.path.splitext(rel_path)[0]}-delete-{uuid4().hex[:8]}.parquet"
             del_abs = os.path.join(tdir, del_rel)
@@ -973,8 +982,7 @@ class DuckLakeWriter:
         import os
         import duckdb
         with self.engine.connect() as conn:
-            data_path = conn.execute(text(
-                "SELECT value FROM ducklake_metadata WHERE key='data_path'")).scalar()
+            data_path = self._data_path(conn)
         abs_data = fs_path or os.path.join(data_path, schema_name, table_name, rel_path)
         c = con or duckdb.connect()
         positions = [r[0] for r in c.execute(

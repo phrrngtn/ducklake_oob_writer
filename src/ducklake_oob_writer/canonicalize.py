@@ -32,8 +32,9 @@ from __future__ import annotations
 
 from loguru import logger
 from sqlalchemy import (BigInteger, Column, Connection, MetaData, Table, case,
-                        func, inspect, select, text, update)
+                        func, inspect, select, update)
 
+from ducklake_oob_writer import inlined
 from ducklake_oob_writer.catalog import DUCKLAKE_METADATA
 
 
@@ -94,12 +95,15 @@ def _renumber(conn):
         #      our MetaData), so remap them the same way — else an out-of-order inlined
         #      backfill would time-travel wrong after the renumber.
         if inspect(conn).has_table("ducklake_inlined_data_tables"):
-            for (name,) in conn.execute(text("SELECT table_name FROM ducklake_inlined_data_tables")):
+            for (name,) in conn.execute(select(inlined.REGISTRY.c.table_name)):
+                itbl = Table(name, MetaData(),
+                             Column("begin_snapshot", BigInteger),
+                             Column("end_snapshot", BigInteger))
                 for colname in ("begin_snapshot", "end_snapshot"):
-                    conn.execute(text(
-                        f"UPDATE {name} SET {colname} = "
-                        f"(SELECT new_id FROM _oob_violators WHERE old_id = {colname}) "
-                        f"WHERE {colname} IN (SELECT old_id FROM _oob_violators)"))
+                    col = itbl.c[colname]
+                    conn.execute(update(itbl).where(col.in_(moved)).values(
+                        {colname: select(violators.c.new_id)
+                                  .where(violators.c.old_id == col).scalar_subquery()}))
 
         # (4) the two snapshot_id-PK tables — permutation via offset (collision-free):
         #     shift the moved ids past the max, then map them down off `violators`.
