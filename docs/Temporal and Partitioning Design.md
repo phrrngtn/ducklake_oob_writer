@@ -195,6 +195,7 @@ format). Two consequences:
 | Heterogeneous file locations (absolute URIs / `path_is_relative=False`; one catalog, many backends) | **implemented** + tested |
 | Inlined data (`inline_rows`: rows in the catalog, no Parquet/DuckDB) — scalar/simple types; OOO-safe; flush to Parquet natively | **implemented** + tested (differential vs native DuckDB) |
 | File-resident **deletes** (`delete_rows` / `delete_where`: DuckLake position delete-files, merge-on-read) — OOO-refused | **implemented** + tested |
+| **Current-state replica** (`Replica.apply(upserts, deletes)`: net-change merge for CT / CDC-as-CT) | **implemented** + tested |
 | Diff-compression's delta recompute on out-of-order backfill | open — neighbour-relative; a higher (diff) layer, not the primitive |
 
 `delete_rows` writes a `(file_path, pos)` delete-file and registers it in
