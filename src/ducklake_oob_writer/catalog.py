@@ -339,9 +339,9 @@ def create_catalog(engine, schema=None):
     meta = _build_metadata(schema=schema)
 
     if schema:
-        from sqlalchemy import text
+        from sqlalchemy.schema import CreateSchema
         with engine.connect() as conn:
-            conn.execute(text(f'CREATE SCHEMA IF NOT EXISTS "{schema}"'))
+            conn.execute(CreateSchema(schema, if_not_exists=True))
             conn.commit()
 
     meta.create_all(engine)
