@@ -45,12 +45,16 @@ def _renumber(conn):
     changes = meta.tables["ducklake_snapshot_changes"]
 
     # (1) canonical id per snapshot, in SQL: schema snapshots first (by id), then data
-    #     snapshots by transaction-time. A "data" snapshot is one that inserted data —
-    #     a Parquet file OR inlined rows — per the change log (inlined inserts write no
-    #     data_file row, so we must read the log, not ducklake_data_file).
+    #     snapshots by transaction-time. A "data" snapshot is one that changed data —
+    #     a Parquet insert, inlined rows, or a delete (file or inlined) — per the change
+    #     log (inlined inserts/deletes write no data_file row, so we read the log, not
+    #     ducklake_data_file). Deletes must be ordered too, or a backfilled delete lands
+    #     in the wrong place in history.
     data_snaps = select(changes.c.snapshot_id.label("sid")).where(
         changes.c.changes_made.like("inserted_into_table:%")
-        | changes.c.changes_made.like("inlined_insert:%")).distinct().subquery()
+        | changes.c.changes_made.like("inlined_insert:%")
+        | changes.c.changes_made.like("deleted_from_table:%")
+        | changes.c.changes_made.like("inlined_delete:%")).distinct().subquery()
     ranked = select(
         snap.c.snapshot_id.label("old_id"),
         (func.row_number().over(order_by=[

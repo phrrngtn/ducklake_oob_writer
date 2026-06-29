@@ -194,11 +194,20 @@ format). Two consequences:
 | Content-hash incorporation log (`oob_incorporation`: both clocks + hash) + `lake_as_known_at` | **implemented** + tested |
 | Heterogeneous file locations (absolute URIs / `path_is_relative=False`; one catalog, many backends) | **implemented** + tested |
 | Inlined data (`inline_rows`: rows in the catalog, no Parquet/DuckDB) — scalar/simple types; OOO-safe; flush to Parquet natively | **implemented** + tested (differential vs native DuckDB) |
-| Generalizing the fold over deletes / replacements / schema changes | open — needs per-event identity + ordering semantics |
+| File-resident **deletes** (`delete_rows` / `delete_where`: DuckLake position delete-files, merge-on-read) — OOO-refused | **implemented** + tested |
+| Diff-compression's delta recompute on out-of-order backfill | open — neighbour-relative; a higher (diff) layer, not the primitive |
 
-Deletes/replacements/schema-changes are also events; the clean append/incorporate
-story above assumes one artifact = one add-event, and the general case needs each
-mutation to carry its own stable identity before the fold is fully general.
+`delete_rows` writes a `(file_path, pos)` delete-file and registers it in
+`ducklake_delete_file` (the data file is untouched); an **UPDATE** is delete-positions +
+`register_*` the replacement. **Out-of-order deletes are refused** by design: a delete
+references prior state (a data file's positions), so reordering it is unsafe — and tailing
+CT/CDC/backlog sources are monotonic, so this Just Works; a backfilled delete is a
+deliberate error rather than a niche feature. (`recanonicalize` now orders delete
+snapshots by transaction-time too, so an OOO *insert* arriving alongside existing deletes
+still canonicalizes correctly.) The one genuinely-open piece is **diff-compression**:
+synthesising deltas from periodic full snapshots makes the deltas *neighbour-relative*, so
+an out-of-order backfill there forces a delta *recompute* — that lives in the diff layer,
+above this primitive.
 
 ---
 

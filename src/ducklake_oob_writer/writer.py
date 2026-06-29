@@ -930,6 +930,114 @@ class DuckLakeWriter:
                      n=n, schema=schema_name, table=table_name)
         return {"inlined": n, "snapshot_id": snapshot_id}
 
+    def delete_rows(self, table_name, rel_path, positions, *, schema_name="main",
+                    snapshot_time=None, author=None, commit_message=None):
+        """Delete specific 0-based row **positions** from a registered Parquet data file
+        via a DuckLake **position delete-file** (merge-on-read) — the data file is left
+        untouched. An UPDATE is delete-these-positions + ``register_*`` the new rows.
+
+        **Out-of-order deletes are refused.** A delete references prior state (a data
+        file's positions), so reordering it is unsafe; if ``snapshot_time`` precedes the
+        catalog's current data frontier it raises. Tailing CT/CDC/backlog sources are
+        monotonic, so this Just Works; backfilled deletes are a deliberate error.
+
+        Needs ``duckdb`` (writes the delete-file). ``positions`` is an iterable of ints.
+        """
+        from uuid import uuid4
+        import os
+        import duckdb
+        from ducklake_oob_writer.parquet import footer_and_size
+
+        positions = sorted({int(p) for p in positions})
+        if not positions:
+            return {"deleted": 0, "snapshot_id": None}
+        with self.engine.begin() as conn:
+            self._load_state(conn)
+            table_id = self._find_table_id(conn, table_name, schema_name)
+            df = self._data_file
+            row = conn.execute(select(df.c.data_file_id).where(and_(
+                df.c.table_id == table_id, df.c.path == rel_path,
+                df.c.end_snapshot.is_(None)))).fetchone()
+            if row is None:
+                raise ValueError(f"delete_rows: no current data file {rel_path!r} in "
+                                 f"{schema_name}.{table_name}")
+            data_file_id = row[0]
+
+            # Refuse a backfilled (out-of-order) delete: any data snapshot dated later
+            # than this delete means we'd have to reorder it — which we don't do.
+            sc = self._snapshot_changes
+            data_changes = (sc.c.changes_made.like("inserted_into_table:%")
+                            | sc.c.changes_made.like("inlined_insert:%")
+                            | sc.c.changes_made.like("deleted_from_table:%")
+                            | sc.c.changes_made.like("inlined_delete:%"))
+            data_sids = select(sc.c.snapshot_id).where(data_changes)
+            t_del = snapshot_time or datetime.now()
+            later = conn.execute(select(func.count()).select_from(self._snapshot).where(and_(
+                self._snapshot.c.snapshot_id.in_(data_sids),
+                self._snapshot.c.snapshot_time > t_del))).scalar()
+            if later:
+                raise ValueError(
+                    f"out-of-order delete: snapshot_time {t_del} precedes the current data "
+                    f"frontier — I'm afraid I can't do that. Deletes reference prior state, "
+                    f"so they must arrive in transaction-time order (tailing CT/CDC is "
+                    f"monotonic, so this normally Just Works).")
+
+            data_path = conn.execute(text(
+                "SELECT value FROM ducklake_metadata WHERE key='data_path'")).scalar()
+            tdir = os.path.join(data_path, schema_name, table_name)
+            del_rel = f"{os.path.splitext(rel_path)[0]}-delete-{uuid4().hex[:8]}.parquet"
+            del_abs = os.path.join(tdir, del_rel)
+            d = duckdb.connect()
+            d.execute("CREATE TABLE dl(file_path VARCHAR, pos BIGINT)")
+            d.executemany("INSERT INTO dl VALUES (?, ?)",
+                          [(os.path.join(tdir, rel_path), p) for p in positions])
+            d.execute(f"COPY dl TO '{del_abs}' (FORMAT PARQUET)")
+            d.close()
+            size, footer = footer_and_size(del_abs)
+
+            snapshot_id = self._alloc_snapshot_id()
+            delete_file_id = self._alloc_file_id()   # delete files share the data-file id counter
+            ts = self._table_stats
+            ts_row = conn.execute(select(ts.c.record_count).where(ts.c.table_id == table_id)).fetchone()
+            conn.execute(self._snapshot.insert().values(
+                snapshot_id=snapshot_id, snapshot_time=snapshot_time or func.now(),
+                schema_version=self._schema_version, next_catalog_id=self._next_catalog_id,
+                next_file_id=self._next_file_id))
+            conn.execute(self._t["ducklake_delete_file"].insert().values(
+                delete_file_id=delete_file_id, table_id=table_id, begin_snapshot=snapshot_id,
+                end_snapshot=None, data_file_id=data_file_id, path=del_rel, path_is_relative=True,
+                format="parquet", delete_count=len(positions), file_size_bytes=size,
+                footer_size=footer, encryption_key=None, partial_max=None))
+            if ts_row:
+                conn.execute(ts.update().where(ts.c.table_id == table_id)
+                             .values(record_count=max(0, ts_row[0] - len(positions))))
+            conn.execute(sc.insert().values(
+                snapshot_id=snapshot_id, changes_made=f"deleted_from_table:{table_id}",
+                author=author, commit_message=commit_message or
+                f"Delete {len(positions)} row(s) from {table_name}", commit_extra_info=None))
+            recanonicalize(conn)
+        logger.info("deleted {n} row(s) from {schema}.{table} ({path})",
+                    n=len(positions), schema=schema_name, table=table_name, path=rel_path)
+        return {"deleted": len(positions), "snapshot_id": snapshot_id, "delete_file_id": delete_file_id}
+
+    def delete_where(self, table_name, rel_path, predicate, *, schema_name="main",
+                     fs_path=None, con=None, **kw):
+        """Delete rows of a registered Parquet file matching a SQL ``predicate`` over the
+        file's columns — resolves their physical positions with DuckDB's
+        ``file_row_number`` and calls :meth:`delete_rows`. ``predicate`` is a trusted SQL
+        boolean expression. Needs ``duckdb``."""
+        import os
+        import duckdb
+        with self.engine.connect() as conn:
+            data_path = conn.execute(text(
+                "SELECT value FROM ducklake_metadata WHERE key='data_path'")).scalar()
+        abs_data = fs_path or os.path.join(data_path, schema_name, table_name, rel_path)
+        c = con or duckdb.connect()
+        positions = [r[0] for r in c.execute(
+            f"SELECT file_row_number FROM read_parquet('{abs_data}', file_row_number=true) "
+            f"WHERE {predicate}").fetchall()]
+        return self.delete_rows(table_name, rel_path, positions, schema_name=schema_name, **kw)
+
     def current_tables(self):
         """List all current (non-deleted) tables.
 
