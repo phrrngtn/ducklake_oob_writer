@@ -174,6 +174,34 @@ Lineage rides on `ducklake_snapshot_changes.commit_extra_info` as a JSON string
 rule4's `doc/provenance_capture.md`. The **data** rows stay raw; provenance is
 metadata-level only.
 
+## Implementation notes
+
+### SQLAlchemy Core for the catalog; raw DuckDB for the Parquet tool
+
+There are two distinct roles a database plays here, and only one is a portability
+surface — so they get different treatment:
+
+- **The catalog** (the `ducklake_*` metadata tables) is **polymorphic**: it may be
+  PostgreSQL *or* SQLite *or* DuckDB. Every statement that touches it must compile
+  against whichever backend it happens to be, so **all catalog DML uses the SQLAlchemy
+  expression language with bound parameters — no embedded SQL.** This includes the
+  *dynamic* inlined data tables (`ducklake_inlined_data_<tid>_<sv>`), which `inlined.py`
+  exposes as runtime `Table` objects whose column types render DuckLake's native storage
+  (BIGINT/DOUBLE/VARCHAR/BOOLEAN), so create/insert/update go through Core just like the
+  static tables.
+
+- **DuckDB used as a Parquet tool** (`read_parquet`, `COPY … TO`, `file_row_number`) is
+  **monomorphic**: it is *always* DuckDB regardless of the catalog backend, used to read
+  and write the actual data files. It is not a portability surface — there is no other
+  dialect it must also satisfy — so raw `duckdb` SQL is correct there. Wrapping it in
+  SQLAlchemy or a `@compiles` dialect compiler would be machinery for a portability that
+  doesn't exist.
+
+The rule: **abstract the polymorphic surface (the catalog → Core); leave the monomorphic
+tool alone (DuckDB-qua-Parquet → raw).** A dialect compiler (`@compiles`) earns its keep
+only when a construct must render *differently across dialects*; the file-ops render one
+way, so there is nothing to compile per-dialect.
+
 ## Constraints / gotchas
 
 - **Single writer per catalog.** Catalog id counters (`next_catalog_id`,
