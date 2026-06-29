@@ -33,7 +33,7 @@ from ducklake_oob_writer.incorporation import (
     lake_as_known_at,
 )
 from ducklake_oob_writer.parquet import content_hash, footer_and_size
-from ducklake_oob_writer.replica import Replica
+from ducklake_oob_writer.replica import HistoryReplica, Replica
 from ducklake_oob_writer.writer import DuckLakeWriter
 
 # loguru library convention: stay silent unless the consuming app opts in with
@@ -52,6 +52,7 @@ __all__ = [
     "create_incorporation_log",
     "lake_as_known_at",
     "Replica",
+    "HistoryReplica",
     "content_hash",
     "footer_and_size",
     # maintenance (delegated to DuckLake's native engine; needs the `duckdb` extra)
