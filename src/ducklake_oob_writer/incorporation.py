@@ -23,10 +23,10 @@ from __future__ import annotations
 import datetime as _dt
 
 from loguru import logger
-from sqlalchemy import (BigInteger, Column, DateTime, MetaData, Table, Text, func,
-                        select, text)
+from sqlalchemy import (BigInteger, Column, DateTime, MetaData, Table, Text, and_, func,
+                        select)
 
-from ducklake_oob_writer.catalog import create_catalog
+from ducklake_oob_writer.catalog import DUCKLAKE_METADATA, create_catalog
 
 _META = MetaData()
 INCORPORATION_LOG = Table(
@@ -93,48 +93,61 @@ def lake_as_known_at(source_engine, target_engine, *, seq=None, incorporation_ti
     cut = (log.c.incorporation_seq <= seq if seq is not None
            else log.c.incorporation_time <= incorporation_time)
 
+    M = DUCKLAKE_METADATA.tables
+    meta_t, tbl_t, sch_t, col_t = (M["ducklake_metadata"], M["ducklake_table"],
+                                   M["ducklake_schema"], M["ducklake_column"])
+    pcol_t, pinfo_t = M["ducklake_partition_column"], M["ducklake_partition_info"]
+    df_t, snap_t, fcs_t = (M["ducklake_data_file"], M["ducklake_snapshot"],
+                           M["ducklake_file_column_stats"])
+    cmap_t, nmap_t = M["ducklake_column_mapping"], M["ducklake_name_mapping"]
+
     with source_engine.connect() as src:
-        data_path = src.execute(text(
-            "SELECT value FROM ducklake_metadata WHERE key = 'data_path'")).scalar()
+        data_path = src.execute(select(meta_t.c.value)
+                                .where(meta_t.c.key == "data_path")).scalar()
         included = {r[0] for r in src.execute(select(log.c.data_file_id).where(cut))}
 
         # schema (current tables + columns) and any partition specs
-        tables = src.execute(text(
-            "SELECT t.table_id, s.schema_name, t.table_name "
-            "FROM ducklake_table t JOIN ducklake_schema s ON t.schema_id = s.schema_id "
-            "WHERE t.end_snapshot IS NULL AND s.end_snapshot IS NULL ORDER BY t.table_id")).fetchall()
+        tables = src.execute(
+            select(tbl_t.c.table_id, sch_t.c.schema_name, tbl_t.c.table_name)
+            .select_from(tbl_t.join(sch_t, tbl_t.c.schema_id == sch_t.c.schema_id))
+            .where(and_(tbl_t.c.end_snapshot.is_(None), sch_t.c.end_snapshot.is_(None)))
+            .order_by(tbl_t.c.table_id)).fetchall()
         cols, partcols = {}, {}
         for tid, sname, tname in tables:
-            colrows = src.execute(text(
-                "SELECT column_id, column_name, column_type FROM ducklake_column "
-                "WHERE table_id = :t AND end_snapshot IS NULL ORDER BY column_order"), {"t": tid}).fetchall()
+            colrows = src.execute(
+                select(col_t.c.column_id, col_t.c.column_name, col_t.c.column_type)
+                .where(and_(col_t.c.table_id == tid, col_t.c.end_snapshot.is_(None)))
+                .order_by(col_t.c.column_order)).fetchall()
             cols[tid] = (sname, tname, [(n, ty) for _, n, ty in colrows])
             id2name = {cid: n for cid, n, _ in colrows}
-            pc = src.execute(text(
-                "SELECT pc.column_id FROM ducklake_partition_column pc "
-                "JOIN ducklake_partition_info pi ON pc.partition_id = pi.partition_id "
-                "WHERE pc.table_id = :t AND pi.end_snapshot IS NULL "
-                "ORDER BY pc.partition_key_index"), {"t": tid}).fetchall()
+            pc = src.execute(
+                select(pcol_t.c.column_id)
+                .select_from(pcol_t.join(pinfo_t, pcol_t.c.partition_id == pinfo_t.c.partition_id))
+                .where(and_(pcol_t.c.table_id == tid, pinfo_t.c.end_snapshot.is_(None)))
+                .order_by(pcol_t.c.partition_key_index)).fetchall()
             partcols[tid] = [id2name[cid] for (cid,) in pc if cid in id2name]
 
         # the included files, with stats + transaction-time + mapping
         files = []
-        for fid, tid, path, rc, fsz, foot, st, mid in src.execute(text(
-                "SELECT df.data_file_id, df.table_id, df.path, df.record_count, "
-                "df.file_size_bytes, df.footer_size, s.snapshot_time, df.mapping_id "
-                "FROM ducklake_data_file df "
-                "JOIN ducklake_snapshot s ON df.begin_snapshot = s.snapshot_id "
-                "WHERE df.end_snapshot IS NULL")).fetchall():
+        file_rows = src.execute(
+            select(df_t.c.data_file_id, df_t.c.table_id, df_t.c.path, df_t.c.record_count,
+                   df_t.c.file_size_bytes, df_t.c.footer_size, snap_t.c.snapshot_time,
+                   df_t.c.mapping_id)
+            .select_from(df_t.join(snap_t, df_t.c.begin_snapshot == snap_t.c.snapshot_id))
+            .where(df_t.c.end_snapshot.is_(None))).fetchall()
+        for fid, tid, path, rc, fsz, foot, st, mid in file_rows:
             if fid not in included:
                 continue
+            stat_rows = src.execute(
+                select(col_t.c.column_name, fcs_t.c.min_value, fcs_t.c.max_value,
+                       fcs_t.c.value_count, fcs_t.c.null_count, fcs_t.c.column_size_bytes,
+                       fcs_t.c.contains_nan)
+                .select_from(fcs_t.join(col_t, fcs_t.c.column_id == col_t.c.column_id))
+                .where(and_(fcs_t.c.data_file_id == fid,
+                            col_t.c.end_snapshot.is_(None)))).fetchall()
             stats = {n: {"min_value": mn, "max_value": mx, "value_count": vc,
                          "null_count": nc, "column_size_bytes": csz, "contains_nan": cn}
-                     for n, mn, mx, vc, nc, csz, cn in src.execute(text(
-                        "SELECT col.column_name, fcs.min_value, fcs.max_value, fcs.value_count, "
-                        "fcs.null_count, fcs.column_size_bytes, fcs.contains_nan "
-                        "FROM ducklake_file_column_stats fcs "
-                        "JOIN ducklake_column col ON fcs.column_id = col.column_id "
-                        "WHERE fcs.data_file_id = :f AND col.end_snapshot IS NULL"), {"f": fid}).fetchall()}
+                     for n, mn, mx, vc, nc, csz, cn in stat_rows}
             files.append({"table_id": tid, "path": path, "record_count": rc,
                           "file_size_bytes": fsz, "footer_size": foot,
                           "transaction_time": _parse_ts(st), "stats": stats or None, "mapping_id": mid})
@@ -145,12 +158,13 @@ def lake_as_known_at(source_engine, target_engine, *, seq=None, incorporation_ti
             n=len(included))
 
         mappings = {}
-        for mid, mtid, mtype in src.execute(text(
-                "SELECT mapping_id, table_id, type FROM ducklake_column_mapping")).fetchall():
-            nm = src.execute(text(
-                "SELECT nm.source_name, col.column_name, nm.is_partition "
-                "FROM ducklake_name_mapping nm JOIN ducklake_column col ON nm.target_field_id = col.column_id "
-                "WHERE nm.mapping_id = :m AND col.end_snapshot IS NULL ORDER BY nm.column_id"), {"m": mid}).fetchall()
+        for mid, mtid, mtype in src.execute(
+                select(cmap_t.c.mapping_id, cmap_t.c.table_id, cmap_t.c.type)).fetchall():
+            nm = src.execute(
+                select(nmap_t.c.source_name, col_t.c.column_name, nmap_t.c.is_partition)
+                .select_from(nmap_t.join(col_t, nmap_t.c.target_field_id == col_t.c.column_id))
+                .where(and_(nmap_t.c.mapping_id == mid, col_t.c.end_snapshot.is_(None)))
+                .order_by(nmap_t.c.column_id)).fetchall()
             mappings[mid] = {"table_id": mtid, "type": mtype,
                              "cols": [(sn, cn, bool(isp)) for sn, cn, isp in nm]}
 
@@ -179,12 +193,11 @@ def lake_as_known_at(source_engine, target_engine, *, seq=None, incorporation_ti
                 continue
             old_to_new_mid[old_mid] = new_mid
             tgt_tid = tgt_table[m["table_id"]]
-            tc.execute(text("INSERT INTO ducklake_column_mapping(mapping_id, table_id, type) "
-                            "VALUES (:m,:t,:ty)"), {"m": new_mid, "t": tgt_tid, "ty": m["type"]})
+            tc.execute(cmap_t.insert().values(mapping_id=new_mid, table_id=tgt_tid, type=m["type"]))
             for idx, (sn, cn, isp) in enumerate(m["cols"]):
-                tc.execute(text("INSERT INTO ducklake_name_mapping(mapping_id, column_id, source_name, "
-                                "target_field_id, parent_column, is_partition) VALUES (:m,:c,:s,:f,NULL,:p)"),
-                           {"m": new_mid, "c": idx, "s": sn, "f": field_of[tgt_tid][cn], "p": isp})
+                tc.execute(nmap_t.insert().values(
+                    mapping_id=new_mid, column_id=idx, source_name=sn,
+                    target_field_id=field_of[tgt_tid][cn], parent_column=None, is_partition=isp))
 
     name_of = {tid: cols[tid] for tid in cols}
     for f in sorted(files, key=lambda f: (f["transaction_time"], f["path"])):
@@ -195,6 +208,6 @@ def lake_as_known_at(source_engine, target_engine, *, seq=None, incorporation_ti
             schema_name=sname, column_stats=f["stats"], snapshot_time=f["transaction_time"])
         if f["mapping_id"] is not None and f["mapping_id"] in old_to_new_mid:
             with target_engine.begin() as tc:
-                tc.execute(text("UPDATE ducklake_data_file SET mapping_id = :m WHERE data_file_id = :d"),
-                           {"m": old_to_new_mid[f["mapping_id"]], "d": info["data_file_id"]})
+                tc.execute(df_t.update().where(df_t.c.data_file_id == info["data_file_id"])
+                           .values(mapping_id=old_to_new_mid[f["mapping_id"]]))
     return included
