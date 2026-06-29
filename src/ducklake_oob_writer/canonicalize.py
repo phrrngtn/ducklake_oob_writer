@@ -45,17 +45,18 @@ def _renumber(conn):
     snap = meta.tables["ducklake_snapshot"]
     changes = meta.tables["ducklake_snapshot_changes"]
 
-    # (1) canonical id per snapshot, in SQL: schema snapshots first (by id), then data
-    #     snapshots by transaction-time. A "data" snapshot is one that changed data —
-    #     a Parquet insert, inlined rows, or a delete (file or inlined) — per the change
-    #     log (inlined inserts/deletes write no data_file row, so we read the log, not
-    #     ducklake_data_file). Deletes must be ordered too, or a backfilled delete lands
-    #     in the wrong place in history.
+    # (1) canonical id per snapshot, in SQL: the *initial* schema snapshots first (by id),
+    #     then temporal snapshots by transaction-time. A "temporal" snapshot is one tied to
+    #     a point in time — a Parquet insert, inlined rows, a delete (file or inlined), or a
+    #     mid-stream ALTER (a schema change happens *at a time*, so it must keep its temporal
+    #     place, not front-load with the create-table DDL). Read the change log, not
+    #     ducklake_data_file (inlined inserts/deletes and ALTERs write no data_file row).
     data_snaps = select(changes.c.snapshot_id.label("sid")).where(
         changes.c.changes_made.like("inserted_into_table:%")
         | changes.c.changes_made.like("inlined_insert:%")
         | changes.c.changes_made.like("deleted_from_table:%")
-        | changes.c.changes_made.like("inlined_delete:%")).distinct().subquery()
+        | changes.c.changes_made.like("inlined_delete:%")
+        | changes.c.changes_made.like("altered_table:%")).distinct().subquery()
     ranked = select(
         snap.c.snapshot_id.label("old_id"),
         (func.row_number().over(order_by=[

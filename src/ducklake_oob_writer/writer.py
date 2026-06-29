@@ -399,6 +399,72 @@ class DuckLakeWriter:
             "column_ids": column_ids,
         }
 
+    def add_column(self, table_name, column_name, column_type, *, schema_name="main",
+                   nulls_allowed=True, snapshot_time=None, author=None, commit_message=None):
+        """Evolve a table's schema by appending a column — DuckLake-native ALTER ADD COLUMN.
+
+        A new ``ducklake_column`` row at the next ``column_order`` with ``begin_snapshot`` =
+        the ALTER snapshot, whose ``schema_version`` is bumped (a new inlined data table is
+        minted for that version on the next inline). Pre-existing data files / inlined rows
+        read NULL for the new column — the reader resolves the column set as of each
+        snapshot's schema_version. Mirrors what DuckDB writes (``altered_table:<tid>``).
+        Additive only — no drops/renames. Returns column_id / snapshot_id / schema_version.
+        """
+        with self.engine.begin() as conn:
+            self._load_state(conn)
+            table_id = self._find_table_id(conn, table_name, schema_name)
+            col = self._column
+            max_order = conn.execute(
+                select(func.max(col.c.column_order))
+                .where(and_(col.c.table_id == table_id, col.c.end_snapshot.is_(None)))).scalar() or 0
+
+            snapshot_id = self._alloc_snapshot_id()
+            column_id = self._alloc_catalog_id()        # bumps next_catalog_id
+            self._schema_version += 1
+
+            conn.execute(self._snapshot.insert().values(
+                snapshot_id=snapshot_id, snapshot_time=snapshot_time or func.now(),
+                schema_version=self._schema_version,
+                next_catalog_id=self._next_catalog_id, next_file_id=self._next_file_id))
+            conn.execute(self._schema_versions.insert().values(
+                begin_snapshot=snapshot_id, schema_version=self._schema_version, table_id=table_id))
+            conn.execute(col.insert().values(
+                column_id=column_id, begin_snapshot=snapshot_id, end_snapshot=None,
+                table_id=table_id, column_order=max_order + 1, column_name=column_name,
+                column_type=column_type, initial_default=None, default_value=None,
+                nulls_allowed=nulls_allowed, parent_column=None,
+                default_value_type=None, default_value_dialect=None))
+            conn.execute(self._snapshot_changes.insert().values(
+                snapshot_id=snapshot_id, changes_made=f"altered_table:{table_id}",
+                author=author,
+                commit_message=commit_message or f"Add column {column_name} to {table_name}",
+                commit_extra_info=None))
+        logger.info("added column {col} {type} to {schema}.{table} (schema_version {sv})",
+                    col=column_name, type=column_type, schema=schema_name, table=table_name,
+                    sv=self._schema_version)
+        return {"column_id": column_id, "snapshot_id": snapshot_id,
+                "schema_version": self._schema_version}
+
+    def reconcile_columns(self, table_name, desired_columns, *, schema_name="main",
+                          snapshot_time=None):
+        """Make the table's columns a superset of ``desired_columns`` (a list of
+        ``(name, ducklake_type)``). Columns already present (by name) are left alone;
+        missing ones are appended via :meth:`add_column`. Additive only — the schema-as-data
+        driver (e.g. a ``column_role`` capture of the source) supplies the desired set, and
+        this is the diff→evolve step. Returns the list of column names added."""
+        with self.engine.connect() as conn:
+            table_id = self._find_table_id(conn, table_name, schema_name)
+            existing = {r[0] for r in conn.execute(
+                select(self._column.c.column_name).where(and_(
+                    self._column.c.table_id == table_id,
+                    self._column.c.end_snapshot.is_(None))))}
+        added = [name for name, _ in desired_columns if name not in existing]
+        for name, ctype in desired_columns:
+            if name not in existing:
+                self.add_column(table_name, name, ctype, schema_name=schema_name,
+                                snapshot_time=snapshot_time)
+        return added
+
     def set_partitioning(self, table_name, columns, schema_name="main",
                          snapshot_time=None, author=None, commit_message=None):
         """Declare partition columns for an existing table (DuckLake-native).
