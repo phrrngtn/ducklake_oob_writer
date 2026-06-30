@@ -50,7 +50,7 @@ from datetime import datetime, timezone
 from uuid import uuid4
 
 from loguru import logger
-from sqlalchemy import select, func, and_
+from sqlalchemy import select, func, and_, text
 
 from ducklake_oob_writer import inlined
 from ducklake_oob_writer.canonicalize import recanonicalize
@@ -790,10 +790,14 @@ class DuckLakeWriter:
         if with_column_stats:
             record_count, cstats = _column_stats(fs_path, con=con)
         else:
-            import duckdb
-            c = con or duckdb.connect()
+            from ducklake_oob_writer.parquet import duck_engine
+            eng = None if con is not None else duck_engine()
+            c = con or eng.connect()
             record_count = c.execute(
-                "SELECT count(*) FROM read_parquet(?)", [fs_path]).fetchone()[0]
+                text("SELECT count(*) FROM read_parquet(:p)"), {"p": fs_path}).scalar()
+            if eng is not None:
+                c.close()
+                eng.dispose()
             cstats = None
         return self.register_data_file(
             table_name,
@@ -965,8 +969,7 @@ class DuckLakeWriter:
         """
         from uuid import uuid4
         import os
-        import duckdb
-        from ducklake_oob_writer.parquet import footer_and_size
+        from ducklake_oob_writer.parquet import footer_and_size, write_rows_parquet
 
         positions = sorted({int(p) for p in positions})
         if not positions:
@@ -1006,12 +1009,9 @@ class DuckLakeWriter:
             tdir = os.path.join(data_path, schema_name, table_name)
             del_rel = f"{os.path.splitext(rel_path)[0]}-delete-{uuid4().hex[:8]}.parquet"
             del_abs = os.path.join(tdir, del_rel)
-            d = duckdb.connect()
-            d.execute("CREATE TABLE dl(file_path VARCHAR, pos BIGINT)")
-            d.executemany("INSERT INTO dl VALUES (?, ?)",
-                          [(os.path.join(tdir, rel_path), p) for p in positions])
-            d.execute(f"COPY dl TO '{del_abs}' (FORMAT PARQUET)")
-            d.close()
+            abs_data = os.path.join(tdir, rel_path)
+            write_rows_parquet([("file_path", "varchar"), ("pos", "int64")],
+                               [(abs_data, p) for p in positions], del_abs)
             size, footer = footer_and_size(del_abs)
 
             snapshot_id = self._alloc_snapshot_id()
@@ -1046,14 +1046,19 @@ class DuckLakeWriter:
         ``file_row_number`` and calls :meth:`delete_rows`. ``predicate`` is a trusted SQL
         boolean expression. Needs ``duckdb``."""
         import os
-        import duckdb
+        from ducklake_oob_writer.parquet import duck_engine
         with self.engine.connect() as conn:
             data_path = self._data_path(conn)
         abs_data = fs_path or os.path.join(data_path, schema_name, table_name, rel_path)
-        c = con or duckdb.connect()
-        positions = [r[0] for r in c.execute(
-            f"SELECT file_row_number FROM read_parquet('{abs_data}', file_row_number=true) "
-            f"WHERE {predicate}").fetchall()]
+        # read_parquet + file_row_number + the trusted predicate are duckdb-specific -> text()
+        stmt = text(f"SELECT file_row_number FROM read_parquet(:p, file_row_number=true) "
+                    f"WHERE {predicate}")
+        eng = None if con is not None else duck_engine()
+        c = con or eng.connect()
+        positions = [r[0] for r in c.execute(stmt, {"p": abs_data}).fetchall()]
+        if eng is not None:
+            c.close()
+            eng.dispose()
         return self.delete_rows(table_name, rel_path, positions, schema_name=schema_name, **kw)
 
     def current_tables(self):

@@ -33,7 +33,7 @@ from ducklake_oob_writer.incorporation import (
     create_incorporation_log,
     lake_as_known_at,
 )
-from ducklake_oob_writer.parquet import content_hash, footer_and_size
+from ducklake_oob_writer.parquet import content_hash, footer_and_size, write_rows_parquet
 from ducklake_oob_writer.replica import HistoryReplica, Replica
 from ducklake_oob_writer.writer import DuckLakeWriter
 
@@ -56,6 +56,7 @@ __all__ = [
     "HistoryReplica",
     "content_hash",
     "footer_and_size",
+    "write_rows_parquet",
     # maintenance (delegated to DuckLake's native engine; needs the `duckdb` extra)
     "attach_lake",
     "lake_reader",

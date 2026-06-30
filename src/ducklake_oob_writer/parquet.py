@@ -14,7 +14,47 @@ from __future__ import annotations
 import os
 import struct
 
-__all__ = ["footer_and_size", "column_stats", "content_hash"]
+from sqlalchemy import create_engine, text
+
+__all__ = ["footer_and_size", "column_stats", "content_hash", "write_rows_parquet"]
+
+
+def duck_engine():
+    """A transient in-memory SQLAlchemy duckdb engine for the file *reads* (read_parquet /
+    file_row_number). Needs ``duckdb-engine``. Writing a Parquet doesn't involve a database
+    — see ``write_rows_parquet``."""
+    return create_engine("duckdb:///:memory:")
+
+
+def _arrow_type(pa, ducklake_type):
+    base = ducklake_type.split("(", 1)[0].strip().lower()
+    if base in ("decimal", "numeric"):
+        import re
+        m = re.search(r"\((\d+)\s*,\s*(\d+)\)", ducklake_type)
+        return pa.decimal128(int(m.group(1)), int(m.group(2))) if m else pa.decimal128(38, 9)
+    return {
+        "int8": pa.int8(), "int16": pa.int16(), "int32": pa.int32(), "int64": pa.int64(),
+        "integer": pa.int64(), "bigint": pa.int64(), "smallint": pa.int16(), "tinyint": pa.int8(),
+        "float32": pa.float32(), "float64": pa.float64(), "float": pa.float64(), "double": pa.float64(),
+        "varchar": pa.string(), "string": pa.string(), "text": pa.string(),
+        "boolean": pa.bool_(), "bool": pa.bool_(),
+        "date": pa.date32(), "timestamp": pa.timestamp("us"), "time": pa.time64("us"),
+    }.get(base, pa.string())
+
+
+def write_rows_parquet(colspecs, rows, path):
+    """Write ``rows`` to a Parquet file **directly with pyarrow** — no database. Writing a
+    file from rows you already hold isn't a DB operation (reach for duckdb only when you
+    need a join / scan / the replacement scan). The explicit Arrow schema makes the Parquet
+    column types match the DuckLake table exactly. ``colspecs`` = ``[(name, ducklake_type),
+    …]``; ``rows`` = tuples in that column order. Needs ``pyarrow``."""
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    names = [n for n, _ in colspecs]
+    schema = pa.schema([(n, _arrow_type(pa, t)) for n, t in colspecs])
+    table = pa.table({n: [r[i] for r in rows] for i, n in enumerate(names)}, schema=schema)
+    pq.write_table(table, path)
 
 
 def _is_remote(path: str) -> bool:
@@ -93,31 +133,31 @@ def column_stats(path: str, con=None):
     same encoding DuckLake itself uses.
     """
     own = con is None
+    eng = None
     if own:
-        import duckdb  # lazy
-
-        con = duckdb.connect()
+        eng = duck_engine()
+        con = eng.connect()
     try:
-        schema = con.execute("DESCRIBE SELECT * FROM read_parquet(?)", [path]).fetchall()
-        total = con.execute("SELECT count(*) FROM read_parquet(?)", [path]).fetchone()[0]
+        schema = con.execute(text("DESCRIBE SELECT * FROM read_parquet(:p)"), {"p": path}).fetchall()
+        total = con.execute(text("SELECT count(*) FROM read_parquet(:p)"), {"p": path}).scalar()
         sizes = {
             name: (int(sz) if sz is not None else None)
-            for name, sz in con.execute(
+            for name, sz in con.execute(text(
                 "SELECT path_in_schema, sum(total_compressed_size) "
-                "FROM parquet_metadata(?) GROUP BY path_in_schema", [path]).fetchall()
+                "FROM parquet_metadata(:p) GROUP BY path_in_schema"), {"p": path}).fetchall()
         }
         out = []
         for col in schema:
             name, typ = col[0], (col[1] or "").upper()
             q = '"' + name.replace('"', '""') + '"'
-            vc, mn, mx = con.execute(
+            vc, mn, mx = con.execute(text(
                 f"SELECT count({q}), CAST(min({q}) AS VARCHAR), CAST(max({q}) AS VARCHAR) "
-                "FROM read_parquet(?)", [path]).fetchone()
+                "FROM read_parquet(:p)"), {"p": path}).fetchone()
             contains_nan = None
             if any(t in typ for t in ("FLOAT", "DOUBLE", "REAL")):
-                nan = con.execute(
-                    f"SELECT count(*) FILTER (WHERE isnan({q})) FROM read_parquet(?)", [path]
-                ).fetchone()[0]
+                nan = con.execute(text(
+                    f"SELECT count(*) FILTER (WHERE isnan({q})) FROM read_parquet(:p)"),
+                    {"p": path}).scalar()
                 contains_nan = 1 if (nan or 0) > 0 else 0
             out.append((name, {
                 "value_count": int(vc),
@@ -131,3 +171,4 @@ def column_stats(path: str, con=None):
     finally:
         if own:
             con.close()
+            eng.dispose()
