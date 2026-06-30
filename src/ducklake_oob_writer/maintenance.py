@@ -42,6 +42,7 @@ from contextlib import contextmanager
 
 __all__ = [
     "attach_lake",
+    "lake_reader",
     "compact",
     "expire_snapshots",
     "cleanup_old_files",
@@ -99,6 +100,37 @@ def attach_lake(catalog: str, data_path: str, *, alias: str = _ALIAS,
     finally:
         if own:
             con.close()
+
+
+@contextmanager
+def lake_reader(catalog: str, data_path: str, *, alias: str = _ALIAS, read_only: bool = True):
+    """A **SQLAlchemy** connection (duckdb-engine) with the DuckLake catalog attached as
+    ``alias``. Read ``lake.*`` tables with SA Core ``select()``; for duckdb-specific SQL
+    (Parquet-scan table functions, ``AT (TIMESTAMP …)`` time-travel) use
+    ``sqlalchemy.text()`` on the *same* connection. This is the read counterpart of the
+    SA-Core catalog writer — one engine abstraction for DuckDB, native ``duckdb`` reserved
+    for driver-level needs.
+
+    Needs ``duckdb-engine`` (the ``duckdb`` SQLAlchemy dialect). Yields a SA ``Connection``.
+    """
+    from sqlalchemy import create_engine, text
+
+    eng = create_engine("duckdb:///:memory:")
+    con = eng.connect()
+    con.execute(text("INSTALL ducklake"))
+    con.execute(text("LOAD ducklake"))
+    ext = _backend_extension(catalog)
+    if ext:
+        con.execute(text(f"INSTALL {ext}"))
+        con.execute(text(f"LOAD {ext}"))
+    dp = str(data_path).rstrip("/") + "/"
+    ro = ", READ_ONLY" if read_only else ""
+    con.execute(text(f"ATTACH 'ducklake:{_q(catalog)}' AS {alias} (DATA_PATH '{_q(dp)}'{ro})"))
+    try:
+        yield con
+    finally:
+        con.close()
+        eng.dispose()
 
 
 def compact(catalog: str, data_path: str, *, con=None) -> None:

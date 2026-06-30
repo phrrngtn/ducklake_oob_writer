@@ -25,6 +25,7 @@ from ducklake_oob_writer.maintenance import (
     cleanup_old_files,
     compact,
     expire_snapshots,
+    lake_reader,
     run_maintenance,
 )
 from ducklake_oob_writer.canonicalize import recanonicalize
@@ -57,6 +58,7 @@ __all__ = [
     "footer_and_size",
     # maintenance (delegated to DuckLake's native engine; needs the `duckdb` extra)
     "attach_lake",
+    "lake_reader",
     "compact",
     "expire_snapshots",
     "cleanup_old_files",
