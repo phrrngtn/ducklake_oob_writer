@@ -14,7 +14,7 @@ import pytest
 
 pytest.importorskip("duckdb")
 import duckdb
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, inspect, text
 
 import ducklake_oob_writer as dl
 
@@ -91,6 +91,31 @@ def test_equal_timestamp_is_allowed(tmp_path):
     w.inline_rows("t", [{"id": 1, "v": "a"}], snapshot_time=ts)
     w.inline_rows("t", [{"id": 2, "v": "b"}], snapshot_time=ts)          # equal: allowed
     eng.dispose()
+
+
+def test_ancillary_index_only_exists_in_reject_mode(tmp_path):
+    """Attribution is a structured ancillary table (oob_snapshot_table), not changes_made
+    parsing. Default mode never creates it (byte-unchanged for existing consumers); reject mode
+    creates + populates it. The ducklake extension ignores it (not a ducklake_* table)."""
+    # default mode: no ancillary table
+    d0, c0 = os.path.join(str(tmp_path), "d0"), os.path.join(str(tmp_path), "c0.sqlite")
+    eng0, w0 = _writer(c0, d0, reject=False)
+    w0.create_table("main", "t", [("id", "int64"), ("v", "varchar")],
+                    snapshot_time=dt.datetime(2026, 6, 1))
+    w0.inline_rows("t", [{"id": 1, "v": "a"}], snapshot_time=dt.datetime(2026, 6, 10, 12))
+    assert not inspect(eng0).has_table("oob_snapshot_table")
+    eng0.dispose()
+
+    # reject mode: table created + populated (one row per temporal snapshot)
+    d1, c1 = os.path.join(str(tmp_path), "d1"), os.path.join(str(tmp_path), "c1.sqlite")
+    eng1, w1 = _writer(c1, d1, reject=True)
+    w1.create_table("main", "t", [("id", "int64"), ("v", "varchar")],
+                    snapshot_time=dt.datetime(2026, 6, 1))
+    w1.inline_rows("t", [{"id": 1, "v": "a"}], snapshot_time=dt.datetime(2026, 6, 10, 12))
+    assert inspect(eng1).has_table("oob_snapshot_table")
+    with eng1.connect() as c:
+        assert c.execute(text("SELECT count(*) FROM oob_snapshot_table")).scalar() >= 1
+    eng1.dispose()
 
 
 def test_default_still_accepts_and_canonicalizes_out_of_order(tmp_path):

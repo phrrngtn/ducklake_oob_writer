@@ -101,6 +101,7 @@ class HistoryReplica:
             conn.execute(w._snapshot_changes.insert().values(
                 snapshot_id=snap, changes_made=changes, author=None,
                 commit_message=f"cdc commit @ {snapshot_time}", commit_extra_info=None))
+            w._record_snapshot_table(conn, snap, tid, snapshot_time)
             w._maybe_recanonicalize(conn)
         logger.info("{schema}.{table}: commit as snapshot {s} (+{i} / -{d})",
                     schema=self.schema, table=self.table, s=snap, i=inserted, d=superseded)
