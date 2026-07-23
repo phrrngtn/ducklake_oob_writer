@@ -23,7 +23,6 @@ from loguru import logger
 from sqlalchemy import and_, func, select
 
 from ducklake_oob_writer import inlined
-from ducklake_oob_writer.canonicalize import recanonicalize
 
 
 class HistoryReplica:
@@ -62,6 +61,7 @@ class HistoryReplica:
                                 .where(reg.c.table_name == name)).scalar():
                 conn.execute(reg.insert().values(table_id=tid, table_name=name, schema_version=sv))
 
+            w._reject_if_ooo(conn, tid, snapshot_time)
             snap = w._alloc_snapshot_id()
             ts = w._table_stats
             ts_row = conn.execute(select(ts.c.record_count, ts.c.next_row_id, ts.c.file_size_bytes)
@@ -101,7 +101,7 @@ class HistoryReplica:
             conn.execute(w._snapshot_changes.insert().values(
                 snapshot_id=snap, changes_made=changes, author=None,
                 commit_message=f"cdc commit @ {snapshot_time}", commit_extra_info=None))
-            recanonicalize(conn)
+            w._maybe_recanonicalize(conn)
         logger.info("{schema}.{table}: commit as snapshot {s} (+{i} / -{d})",
                     schema=self.schema, table=self.table, s=snap, i=inserted, d=superseded)
         return {"snapshot_id": snap, "ops": len(ops), "inserted": inserted, "superseded": superseded}

@@ -26,6 +26,10 @@ The fix is **automatic**: `register_data_file` keeps `snapshot_id` order aligned
 
 This — together with the **path-vs-rewrite dimension encoding** for partition/pruning columns, and the surrogate-vs-natural-key reasoning behind the whole approach — is written up in full in **[`docs/Temporal and Partitioning Design.md`](docs/Temporal%20and%20Partitioning%20Design.md)**.
 
+### Opt-out: `reject_out_of_order` (monotonic mode)
+
+`DuckLakeWriter(engine, meta, reject_out_of_order=True)` flips the policy: instead of *accepting* an out-of-order arrival and renumbering, it **refuses** any data/inline write whose `snapshot_time` precedes an existing snapshot **for the same table** (`ValueError`). The guard is **per-table**, not global — independently-tailed tables advance on their own source clocks, so table B's legitimately-earlier arrival is never blocked by table A. With no OOO possible, `snapshot_id` order can never diverge from `snapshot_time` order, the automatic renumber becomes a guaranteed no-op (and is skipped), and **`snapshot_id` is a stable cursor** — a downstream client (e.g. a per-table SQLite TTST subscriber cursoring on `ducklake_table_changes` by a stored HWM) can rely on it without a redundant backlog. The trade: you forgo honest late-arriving backfill, so it's a per-lake choice — a single-source-per-table tail-replica lake runs monotonic; a multi-clock-domain federation lake keeps the default accept-OOO + canonicalize. Default is `False` (backward-compatible).
+
 ## Inlined data — small writes with no files
 
 For small, frequent arrivals (e.g. **CDC/CT polling since a high-water mark**) a tiny Parquet file per batch is the wrong move — it creates the small-files problem. DuckLake's answer is **data inlining**: the rows live *directly in the catalog database* (in `ducklake_inlined_data_<table_id>_<schema_version>`, with MVCC bookkeeping `row_id` / `begin_snapshot` / `end_snapshot`), and reads union them with the table's Parquet files.
@@ -44,7 +48,7 @@ Why the restriction: inlined data is rows in the catalog DB, so values must fit 
 | `_build_metadata(schema=None)` | function | Build the SQLAlchemy `MetaData` describing the catalog tables |
 | `DUCKLAKE_METADATA` | constant | Default (unqualified) `MetaData` instance |
 | `DUCKLAKE_VERSION` | constant | DuckLake catalog protocol version (`"1.0"`) |
-| `DuckLakeWriter(engine, meta)` | class | OOB writer |
+| `DuckLakeWriter(engine, meta, *, reject_out_of_order=False)` | class | OOB writer; `reject_out_of_order=True` enforces per-table transaction-time monotonicity (refuse OOO instead of canonicalizing) so `snapshot_id` stays a stable downstream cursor |
 | `footer_and_size(path)` | function | `(file_size_bytes, footer_size)` for a Parquet file (stdlib-only) |
 | `run_maintenance(catalog, data_path, older_than=None)` | function | Compact (attempted) + expire + cleanup; needs `[maintenance]` extra |
 | `attach_lake` / `compact` / `expire_snapshots` / `cleanup_old_files` | functions | Individual maintenance ops (see [Maintenance](#maintenance)) |

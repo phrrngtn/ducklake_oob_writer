@@ -50,7 +50,7 @@ from datetime import datetime, timezone
 from uuid import uuid4
 
 from loguru import logger
-from sqlalchemy import select, func, and_, text
+from sqlalchemy import select, func, and_, or_, literal, text
 
 from ducklake_oob_writer import inlined
 from ducklake_oob_writer.canonicalize import recanonicalize
@@ -78,14 +78,24 @@ class DuckLakeWriter:
     No raw SQL, no f-strings, no dialect branching.
     """
 
-    def __init__(self, engine, meta):
+    def __init__(self, engine, meta, *, reject_out_of_order=False):
         """
         Args:
             engine: SQLAlchemy engine (PG, SQLite, or DuckDB)
             meta: MetaData from ducklake_catalog._build_metadata() or create_catalog()
+            reject_out_of_order: when True, enforce **per-table transaction-time
+                monotonicity** — a data/delete write whose ``snapshot_time`` precedes an
+                existing snapshot for the same table is refused (``ValueError``) instead of
+                being accepted and canonicalized. With no out-of-order arrivals the
+                ``snapshot_id`` order can never diverge from ``snapshot_time`` order, so the
+                automatic renumber becomes a guaranteed no-op (and is skipped) and a
+                downstream subscriber can safely cursor on the now-stable ``snapshot_id``
+                (e.g. a per-table TTST HWM). Default False preserves the accept-OOO +
+                auto-canonicalize behavior (honest late-arriving backfill / federation).
         """
         self.engine = engine
         self.meta = meta
+        self.reject_out_of_order = reject_out_of_order
 
         # Table references — keyed by unqualified name
         self._t = {}
@@ -99,6 +109,42 @@ class DuckLakeWriter:
         self._next_file_id = None
         self._next_snapshot_id = None
         self._schema_version = None
+
+    # ── Out-of-order policy (per-table transaction-time monotonicity) ───
+    def _reject_if_ooo(self, conn, table_id, snapshot_time):
+        """When ``reject_out_of_order`` is set, refuse a data/delete write whose
+        ``snapshot_time`` precedes any existing snapshot that already touched this table.
+
+        **Per-table, not global**: independently-tailed tables may advance on different source
+        clocks, so table B's legitimately-earlier arrival must not be blocked by table A.
+        Attribution reuses the change-log tokens (``inserted_into_table:<tid>`` etc.), matched
+        boundary-safely — the ``changes_made`` value is comma-wrapped so ``LIKE`` distinguishes
+        tid ``5`` from ``50`` and handles the comma-joined form apply_commit writes."""
+        if not self.reject_out_of_order or snapshot_time is None or table_id is None:
+            return
+        snap, changes = self._snapshot, self._snapshot_changes
+        ops = ("inserted_into_table", "inlined_insert", "deleted_from_table",
+               "inlined_delete", "altered_table")
+        wrapped = literal(",").concat(changes.c.changes_made).concat(literal(","))
+        touched = or_(*[wrapped.like(f"%,{op}:{table_id},%") for op in ops])
+        later = conn.execute(
+            select(func.count()).select_from(
+                snap.join(changes, changes.c.snapshot_id == snap.c.snapshot_id))
+            .where(and_(touched, snap.c.snapshot_time > snapshot_time))).scalar()
+        if later:
+            raise ValueError(
+                f"reject_out_of_order: snapshot_time {snapshot_time!r} for table_id "
+                f"{table_id} precedes {later} existing snapshot(s) for that table — "
+                f"out-of-order arrival refused (per-table transaction-time monotonicity)")
+
+    def _maybe_recanonicalize(self, conn):
+        """Renumber snapshots into transaction-time order — unless ``reject_out_of_order`` is
+        set, in which case monotonicity is enforced at write time so the renumber is a
+        guaranteed no-op; skipping it keeps ``snapshot_id`` provably stable for downstream
+        cursors (and saves the scan)."""
+        if self.reject_out_of_order:
+            return
+        recanonicalize(conn)
 
     # ── Table accessors ────────────────────────────────────────────────
 
@@ -592,6 +638,7 @@ class DuckLakeWriter:
                     return {"data_file_id": existing, "snapshot_id": None,
                             "row_id_start": None, "deduped": True}
 
+            self._reject_if_ooo(conn, table_id, snapshot_time)
             snapshot_id = self._alloc_snapshot_id()
             file_id = self._alloc_file_id()
 
@@ -750,7 +797,7 @@ class DuckLakeWriter:
 
             # single query and a no-op unless this file arrived out of order — so
             # callers never have to think about it (see canonicalize.py).
-            recanonicalize(conn)
+            self._maybe_recanonicalize(conn)
 
         return {"data_file_id": file_id, "snapshot_id": snapshot_id,
                 "row_id_start": row_id_start, "deduped": False}
@@ -921,6 +968,7 @@ class DuckLakeWriter:
                 conn.execute(reg.insert().values(
                     table_id=table_id, table_name=inlined_name, schema_version=sv))
 
+            self._reject_if_ooo(conn, table_id, snapshot_time)
             snapshot_id = self._alloc_snapshot_id()
             ts = self._table_stats
             ts_row = conn.execute(select(ts.c.record_count, ts.c.next_row_id, ts.c.file_size_bytes)
@@ -949,7 +997,7 @@ class DuckLakeWriter:
                 author=author,
                 commit_message=commit_message or f"Inline {n} row(s) into {table_name}",
                 commit_extra_info=None))
-            recanonicalize(conn)
+            self._maybe_recanonicalize(conn)
         logger.debug("inlined {n} row(s) into {schema}.{table}",
                      n=n, schema=schema_name, table=table_name)
         return {"inlined": n, "snapshot_id": snapshot_id}
@@ -1034,7 +1082,7 @@ class DuckLakeWriter:
                 snapshot_id=snapshot_id, changes_made=f"deleted_from_table:{table_id}",
                 author=author, commit_message=commit_message or
                 f"Delete {len(positions)} row(s) from {table_name}", commit_extra_info=None))
-            recanonicalize(conn)
+            self._maybe_recanonicalize(conn)
         logger.info("deleted {n} row(s) from {schema}.{table} ({path})",
                     n=len(positions), schema=schema_name, table=table_name, path=rel_path)
         return {"deleted": len(positions), "snapshot_id": snapshot_id, "delete_file_id": delete_file_id}
